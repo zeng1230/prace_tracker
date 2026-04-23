@@ -13,6 +13,12 @@ spring:
       password:
       database: 0
       timeout: 5s
+  rabbitmq:
+    host: localhost
+    port: 5672
+    username: guest
+    password: guest
+    virtual-host: /
   jackson:
     default-property-inclusion: non_null
 
