@@ -147,3 +147,81 @@ Knife4j 文档入口：`http://localhost:8080/doc.html`
 - 为通知防重补充数据库级唯一约束或消息幂等表。
 - 根据业务需要扩展通知发送渠道，目前只实现站内通知落库。
 - 补充更完整的集成测试环境说明，例如 MySQL、Redis、RabbitMQ 的 Docker Compose 启动方式。
+
+## Stage 2 Addendum: RabbitMQ Async Notification
+
+### Stage 2 Goal
+
+Stage 2 completes the async price alert link for the existing Price Tracker project. The refresh flow is still responsible for updating product prices and writing price history, while the notification write path is moved behind RabbitMQ.
+
+### Why RabbitMQ
+
+- Decouple price refresh from notification persistence.
+- Reduce the chance that notification handling slows down or blocks the refresh path.
+- Keep room for later retry, dead-letter, and channel expansion.
+
+### Async Link
+
+```text
+PriceRefreshTask / Internal refresh API
+  -> PriceServiceImpl.refreshProductPrice(productId)
+  -> update product current_price
+  -> insert tb_price_history
+  -> query active watchlist records with notify_enabled = 1
+  -> if currentPrice <= targetPrice, build PriceAlertMessage
+  -> PriceAlertProducer sends message to exchange
+  -> queue receives message through routing key
+  -> PriceAlertConsumer consumes message asynchronously
+  -> NotificationService.consumePriceAlert(message)
+  -> insert tb_notification
+  -> update tb_watchlist.last_notified_price
+```
+
+### Key Classes
+
+- `src/main/java/com/example/price_tracker/config/RabbitMQConfig.java`
+  Defines the exchange, queue, binding, and JSON converter.
+- `src/main/java/com/example/price_tracker/mq/message/PriceAlertMessage.java`
+  RabbitMQ event payload. Fields: `messageId`, `userId`, `productId`, `watchlistId`, `currentPrice`, `targetPrice`, `productName`, `triggeredAt`.
+- `src/main/java/com/example/price_tracker/mq/producer/PriceAlertProducer.java`
+  Sends the message and writes send-before, send-success, and send-failure logs.
+- `src/main/java/com/example/price_tracker/mq/consumer/PriceAlertConsumer.java`
+  Receives the message, logs receive/start/success/failure, and delegates to the notification service.
+- `src/main/java/com/example/price_tracker/service/impl/NotificationServiceImpl.java`
+  Validates the event, applies duplicate suppression based on `last_notified_price`, writes the notification, and updates the watchlist.
+
+### Test Scenarios
+
+Current MQ tests cover these scenarios:
+
+1. Current price is above target price: no RabbitMQ message is sent.
+2. Current price is less than or equal to target price: the RabbitMQ producer is called.
+3. Consumer receives a valid message: notification handling succeeds.
+4. Consumer handling throws an exception: an error log is written and the listener does not rethrow to break the main flow.
+
+Run the focused MQ tests:
+
+```powershell
+.\mvnw.cmd -q "-Dtest=PriceAlertConsumerTest,PriceServiceImplTest,NotificationServiceImplTest" test
+```
+
+Run the full test suite:
+
+```powershell
+.\mvnw.cmd -q test
+```
+
+### Current Stage Boundaries
+
+- The producer only filters business conditions and dispatches messages.
+- Final duplicate suppression is still handled by the consumer side.
+- Listener-side exceptions are logged clearly and swallowed at the MQ boundary so price refresh is not failed by notification-side issues.
+- This stage does not yet implement dead-letter queues, retry orchestration, idempotency tables, or external email/SMS sending.
+
+### Next Steps
+
+- Stronger idempotency guarantees
+- Dead-letter queue
+- Consumer retry strategy
+- Notification channel expansion
+- Better concurrency strategy for large batch refresh jobs

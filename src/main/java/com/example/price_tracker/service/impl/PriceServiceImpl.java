@@ -20,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.UUID;
 
 @Service
 @RequiredArgsConstructor
@@ -84,6 +85,7 @@ public class PriceServiceImpl implements PriceService {
 
     private PriceAlertMessage buildPriceAlertMessage(Product product, Watchlist watchlist, BigDecimal newPrice, LocalDateTime now) {
         return PriceAlertMessage.builder()
+                .messageId(buildMessageId(product.getId(), watchlist.getId()))
                 .userId(watchlist.getUserId())
                 .productId(product.getId())
                 .watchlistId(watchlist.getId())
@@ -92,6 +94,10 @@ public class PriceServiceImpl implements PriceService {
                 .productName(product.getProductName())
                 .triggeredAt(now)
                 .build();
+    }
+
+    private String buildMessageId(Long productId, Long watchlistId) {
+        return productId + "-" + watchlistId + "-" + UUID.randomUUID();
     }
 
     private Product getActiveProductOrThrow(Long productId) {

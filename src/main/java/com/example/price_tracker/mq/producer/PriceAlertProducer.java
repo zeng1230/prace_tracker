@@ -16,26 +16,47 @@ public class PriceAlertProducer {
 
     public void send(PriceAlertMessage message) {
         log.info(
-                "Publishing price alert message, exchange={}, routingKey={}, watchlistId={}, productId={}, userId={}, currentPrice={}, targetPrice={}",
+                "Publishing price alert message, messageId={}, exchange={}, routingKey={}, watchlistId={}, productId={}, userId={}, productName={}, currentPrice={}, targetPrice={}",
+                message.getMessageId(),
                 RabbitMQConfig.PRICE_ALERT_EXCHANGE,
                 RabbitMQConfig.PRICE_ALERT_ROUTING_KEY,
                 message.getWatchlistId(),
                 message.getProductId(),
                 message.getUserId(),
+                message.getProductName(),
                 message.getCurrentPrice(),
                 message.getTargetPrice()
         );
-        rabbitTemplate.convertAndSend(
-                RabbitMQConfig.PRICE_ALERT_EXCHANGE,
-                RabbitMQConfig.PRICE_ALERT_ROUTING_KEY,
-                message
-        );
-        log.info(
-                "Published price alert message successfully, watchlistId={}, productId={}, userId={}, currentPrice={}",
-                message.getWatchlistId(),
-                message.getProductId(),
-                message.getUserId(),
-                message.getCurrentPrice()
-        );
+        try {
+            rabbitTemplate.convertAndSend(
+                    RabbitMQConfig.PRICE_ALERT_EXCHANGE,
+                    RabbitMQConfig.PRICE_ALERT_ROUTING_KEY,
+                    message
+            );
+            log.info(
+                    "Published price alert message successfully, messageId={}, routingKey={}, watchlistId={}, productId={}, userId={}, productName={}, currentPrice={}",
+                    message.getMessageId(),
+                    RabbitMQConfig.PRICE_ALERT_ROUTING_KEY,
+                    message.getWatchlistId(),
+                    message.getProductId(),
+                    message.getUserId(),
+                    message.getProductName(),
+                    message.getCurrentPrice()
+            );
+        } catch (Exception ex) {
+            log.error(
+                    "Failed to publish price alert message, messageId={}, routingKey={}, watchlistId={}, productId={}, userId={}, productName={}, currentPrice={}, targetPrice={}",
+                    message.getMessageId(),
+                    RabbitMQConfig.PRICE_ALERT_ROUTING_KEY,
+                    message.getWatchlistId(),
+                    message.getProductId(),
+                    message.getUserId(),
+                    message.getProductName(),
+                    message.getCurrentPrice(),
+                    message.getTargetPrice(),
+                    ex
+            );
+            throw ex;
+        }
     }
 }

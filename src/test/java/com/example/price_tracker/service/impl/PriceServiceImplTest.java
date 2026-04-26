@@ -79,7 +79,9 @@ class PriceServiceImplTest {
     }
 
     private ArgumentMatcher<PriceAlertMessage> createdPriceAlertMessage() {
-        return message -> message.getUserId().equals(99L)
+        return message -> message.getMessageId() != null
+                && !message.getMessageId().isBlank()
+                && message.getUserId().equals(99L)
                 && message.getProductId().equals(1L)
                 && message.getWatchlistId().equals(5L)
                 && "Laptop".equals(message.getProductName())

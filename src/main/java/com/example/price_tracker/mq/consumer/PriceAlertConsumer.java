@@ -18,8 +18,9 @@ public class PriceAlertConsumer {
     @RabbitListener(queues = RabbitMQConfig.PRICE_ALERT_QUEUE)
     public void consume(PriceAlertMessage message) {
         log.info(
-                "Received price alert message from queue={}, watchlistId={}, productId={}, userId={}, currentPrice={}, targetPrice={}",
+                "Received price alert message from queue={}, messageId={}, watchlistId={}, productId={}, userId={}, currentPrice={}, targetPrice={}",
                 RabbitMQConfig.PRICE_ALERT_QUEUE,
+                message == null ? null : message.getMessageId(),
                 message == null ? null : message.getWatchlistId(),
                 message == null ? null : message.getProductId(),
                 message == null ? null : message.getUserId(),
@@ -27,22 +28,30 @@ public class PriceAlertConsumer {
                 message == null ? null : message.getTargetPrice()
         );
         try {
+            log.info(
+                    "Start processing price alert message, messageId={}, watchlistId={}, productId={}, userId={}",
+                    message == null ? null : message.getMessageId(),
+                    message == null ? null : message.getWatchlistId(),
+                    message == null ? null : message.getProductId(),
+                    message == null ? null : message.getUserId()
+            );
             notificationService.consumePriceAlert(message);
             log.info(
-                    "Consumed price alert message successfully, watchlistId={}, productId={}, userId={}",
+                    "Processed price alert message successfully, messageId={}, watchlistId={}, productId={}, userId={}",
+                    message == null ? null : message.getMessageId(),
                     message == null ? null : message.getWatchlistId(),
                     message == null ? null : message.getProductId(),
                     message == null ? null : message.getUserId()
             );
         } catch (Exception ex) {
             log.error(
-                    "Failed to consume price alert message, watchlistId={}, productId={}, userId={}",
+                    "Failed to process price alert message, messageId={}, watchlistId={}, productId={}, userId={}",
+                    message == null ? null : message.getMessageId(),
                     message == null ? null : message.getWatchlistId(),
                     message == null ? null : message.getProductId(),
                     message == null ? null : message.getUserId(),
                     ex
             );
-            throw ex;
         }
     }
 }

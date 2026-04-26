@@ -14,6 +14,8 @@ import java.time.LocalDateTime;
 @AllArgsConstructor
 public class PriceAlertMessage {
 
+    private String messageId;
+
     private Long userId;
 
     private Long productId;
