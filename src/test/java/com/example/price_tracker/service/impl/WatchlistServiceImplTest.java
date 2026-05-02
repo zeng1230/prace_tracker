@@ -1,11 +1,16 @@
 package com.example.price_tracker.service.impl;
 
+import com.example.price_tracker.common.PageResult;
 import com.example.price_tracker.context.UserContext;
 import com.example.price_tracker.dto.WatchlistAddDto;
+import com.example.price_tracker.dto.WatchlistQueryDto;
 import com.example.price_tracker.entity.Product;
 import com.example.price_tracker.entity.Watchlist;
 import com.example.price_tracker.mapper.ProductMapper;
 import com.example.price_tracker.mapper.WatchlistMapper;
+import com.example.price_tracker.redis.RedisCacheService;
+import com.example.price_tracker.redis.RedisKeyManager;
+import com.example.price_tracker.vo.WatchlistVo;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -16,10 +21,13 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -31,6 +39,9 @@ class WatchlistServiceImplTest {
 
     @Mock
     private ProductMapper productMapper;
+
+    @Mock
+    private RedisCacheService cacheService;
 
     @InjectMocks
     private WatchlistServiceImpl watchlistService;
@@ -54,6 +65,31 @@ class WatchlistServiceImplTest {
 
         assertEquals(10L, id);
         verify(watchlistMapper).updateById(argThat(reactivatedWatchlist()));
+        verify(cacheService).delete(RedisKeyManager.userWatchlistKey(99L));
+    }
+
+    @Test
+    void pageMyWatchlistReturnsCachedResultBeforeDatabaseLookup() {
+        PageResult<WatchlistVo> cached = PageResult.of(List.of(WatchlistVo.builder().id(7L).build()), 1L, 1L, 10L);
+        when(cacheService.get(RedisKeyManager.userWatchlistKey(99L), PageResult.class)).thenReturn(cached);
+
+        PageResult<WatchlistVo> result = watchlistService.pageMyWatchlist(queryDto());
+
+        assertEquals(7L, result.getRecords().get(0).getId());
+        verify(watchlistMapper, never()).selectPage(any(), any());
+    }
+
+    @Test
+    void addWatchlistIgnoresDuplicateActiveRecordWithoutInsert() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        when(watchlistMapper.selectOne(any())).thenReturn(existingActiveWatchlist());
+
+        Long id = watchlistService.addWatchlist(addDto());
+
+        assertEquals(11L, id);
+        verify(watchlistMapper, never()).insert(any(Watchlist.class));
+        verify(watchlistMapper, never()).updateById(any(Watchlist.class));
+        verify(cacheService, never()).delete(anyString());
     }
 
     private ArgumentMatcher<Watchlist> reactivatedWatchlist() {
@@ -74,6 +110,13 @@ class WatchlistServiceImplTest {
         return dto;
     }
 
+    private WatchlistQueryDto queryDto() {
+        WatchlistQueryDto dto = new WatchlistQueryDto();
+        dto.setPageNum(1L);
+        dto.setPageSize(10L);
+        return dto;
+    }
+
     private Product activeProduct() {
         Product product = new Product();
         product.setId(1L);
@@ -90,6 +133,13 @@ class WatchlistServiceImplTest {
         watchlist.setStatus(0);
         watchlist.setNotifyEnabled(0);
         watchlist.setTargetPrice(new BigDecimal("120.00"));
+        return watchlist;
+    }
+
+    private Watchlist existingActiveWatchlist() {
+        Watchlist watchlist = existingDisabledWatchlist();
+        watchlist.setId(11L);
+        watchlist.setStatus(1);
         return watchlist;
     }
 }

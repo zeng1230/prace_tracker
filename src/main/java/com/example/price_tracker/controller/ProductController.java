@@ -10,6 +10,7 @@ import com.example.price_tracker.service.ProductService;
 import com.example.price_tracker.vo.PriceHistoryVo;
 import com.example.price_tracker.vo.ProductDetailVo;
 import com.example.price_tracker.vo.ProductPageVo;
+import com.example.price_tracker.vo.ProductPriceVo;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
@@ -41,6 +42,11 @@ public class ProductController {
     @GetMapping("/{id}")
     public Result<ProductDetailVo> getProductDetail(@PathVariable @Min(value = 1, message = "id must be greater than 0") Long id) {
         return Result.success(productService.getProductDetail(id));
+    }
+
+    @GetMapping("/{id}/price")
+    public Result<ProductPriceVo> getCurrentPrice(@PathVariable @Min(value = 1, message = "id must be greater than 0") Long id) {
+        return Result.success(productService.getCurrentPrice(id));
     }
 
     @GetMapping

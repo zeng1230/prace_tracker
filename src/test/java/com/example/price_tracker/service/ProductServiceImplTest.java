@@ -8,19 +8,22 @@ import com.example.price_tracker.dto.ProductUpdateDto;
 import com.example.price_tracker.entity.Product;
 import com.example.price_tracker.exception.BusinessException;
 import com.example.price_tracker.mapper.ProductMapper;
+import com.example.price_tracker.redis.RedisCacheService;
+import com.example.price_tracker.redis.RedisDistributedLock;
+import com.example.price_tracker.redis.RedisKeyManager;
 import com.example.price_tracker.service.impl.ProductServiceImpl;
 import com.example.price_tracker.vo.ProductDetailVo;
 import com.example.price_tracker.vo.ProductPageVo;
+import com.example.price_tracker.vo.ProductPriceVo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.ValueOperations;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -30,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.startsWith;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -41,27 +45,26 @@ class ProductServiceImplTest {
     private ProductMapper productMapper;
 
     @Mock
-    private RedisTemplate<String, Object> redisTemplate;
+    private RedisCacheService cacheService;
 
     @Mock
-    private ValueOperations<String, Object> valueOperations;
+    private RedisDistributedLock distributedLock;
 
     private ProductServiceImpl productService;
 
     @BeforeEach
     void setUp() {
-        productService = new ProductServiceImpl(productMapper, redisTemplate);
+        productService = new ProductServiceImpl(productMapper, cacheService, distributedLock);
     }
 
     @Test
     void shouldReturnCachedProductDetailBeforeDatabaseLookup() {
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         ProductDetailVo cached = ProductDetailVo.builder()
                 .id(1L)
                 .productName("Kindle")
                 .platform("amazon")
                 .build();
-        when(valueOperations.get("product:detail:1")).thenReturn(cached);
+        when(cacheService.get(RedisKeyManager.productDetailKey(1L), ProductDetailVo.class)).thenReturn(cached);
 
         ProductDetailVo result = productService.getProductDetail(1L);
 
@@ -71,28 +74,67 @@ class ProductServiceImplTest {
 
     @Test
     void shouldLoadProductDetailFromDatabaseAndCacheWhenRedisMisses() {
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
         Product product = buildProduct(2L);
-        when(valueOperations.get("product:detail:2")).thenReturn(null);
+        when(distributedLock.tryLock(eq(RedisKeyManager.lockKey("product:detail:2")), startsWith("product-detail-"), any(Duration.class))).thenReturn(true);
         when(productMapper.selectById(2L)).thenReturn(product);
 
         ProductDetailVo result = productService.getProductDetail(2L);
 
         assertEquals(2L, result.getId());
         assertEquals("USD", result.getCurrency());
-        verify(valueOperations).set(eq("product:detail:2"), any(ProductDetailVo.class));
+        verify(cacheService).set(eq(RedisKeyManager.productDetailKey(2L)), any(ProductDetailVo.class), any(Duration.class));
+        verify(distributedLock).unlock(eq(RedisKeyManager.lockKey("product:detail:2")), startsWith("product-detail-"));
     }
 
     @Test
-    void shouldThrowNotFoundWhenProductDetailDoesNotExist() {
-        when(redisTemplate.opsForValue()).thenReturn(valueOperations);
-        when(valueOperations.get("product:detail:99")).thenReturn(null);
+    void shouldCacheNullWhenProductDetailDoesNotExist() {
+        when(distributedLock.tryLock(eq(RedisKeyManager.lockKey("product:detail:99")), startsWith("product-detail-"), any(Duration.class))).thenReturn(true);
         when(productMapper.selectById(99L)).thenReturn(null);
 
         BusinessException exception = assertThrows(BusinessException.class,
                 () -> productService.getProductDetail(99L));
 
         assertEquals(ResultCode.NOT_FOUND.getCode(), exception.getCode());
+        verify(cacheService).set(eq(RedisKeyManager.nullValueKey("product:detail:99")), eq("NULL"), any(Duration.class));
+    }
+
+    @Test
+    void shouldNotQueryDatabaseWhenNullProductDetailCacheHits() {
+        when(cacheService.get(RedisKeyManager.productDetailKey(99L), ProductDetailVo.class)).thenReturn(null);
+        when(cacheService.get(RedisKeyManager.nullValueKey("product:detail:99"), String.class)).thenReturn("NULL");
+
+        BusinessException exception = assertThrows(BusinessException.class,
+                () -> productService.getProductDetail(99L));
+
+        assertEquals(ResultCode.NOT_FOUND.getCode(), exception.getCode());
+        verify(productMapper, never()).selectById(any());
+    }
+
+    @Test
+    void shouldReturnCachedCurrentPriceBeforeDatabaseLookup() {
+        ProductPriceVo cached = ProductPriceVo.builder()
+                .productId(1L)
+                .currentPrice(new BigDecimal("88.00"))
+                .currency("USD")
+                .build();
+        when(cacheService.get(RedisKeyManager.productPriceKey(1L), ProductPriceVo.class)).thenReturn(cached);
+
+        ProductPriceVo result = productService.getCurrentPrice(1L);
+
+        assertEquals(new BigDecimal("88.00"), result.getCurrentPrice());
+        verify(productMapper, never()).selectById(any());
+    }
+
+    @Test
+    void shouldCacheCurrentPriceAfterDatabaseFallback() {
+        Product product = buildProduct(7L);
+        when(distributedLock.tryLock(eq(RedisKeyManager.lockKey("product:price:7")), startsWith("product-price-"), any(Duration.class))).thenReturn(true);
+        when(productMapper.selectById(7L)).thenReturn(product);
+
+        ProductPriceVo result = productService.getCurrentPrice(7L);
+
+        assertEquals(product.getCurrentPrice(), result.getCurrentPrice());
+        verify(cacheService).set(eq(RedisKeyManager.productPriceKey(7L)), any(ProductPriceVo.class), any(Duration.class));
     }
 
     @Test
@@ -142,7 +184,8 @@ class ProductServiceImplTest {
         Product updated = captor.getValue();
         assertEquals("Kindle Paperwhite", updated.getProductName());
         assertEquals("https://example.com/kindle-new", updated.getProductUrl());
-        verify(redisTemplate).delete("product:detail:3");
+        verify(cacheService).delete(RedisKeyManager.productDetailKey(3L));
+        verify(cacheService).delete(RedisKeyManager.productPriceKey(3L));
     }
 
     @Test
@@ -155,7 +198,8 @@ class ProductServiceImplTest {
         ArgumentCaptor<Product> captor = ArgumentCaptor.forClass(Product.class);
         verify(productMapper).updateById(captor.capture());
         assertEquals(0, captor.getValue().getStatus());
-        verify(redisTemplate).delete("product:detail:4");
+        verify(cacheService).delete(RedisKeyManager.productDetailKey(4L));
+        verify(cacheService).delete(RedisKeyManager.productPriceKey(4L));
     }
 
     @Test

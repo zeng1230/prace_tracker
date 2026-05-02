@@ -8,6 +8,7 @@ import com.example.price_tracker.service.PriceHistoryService;
 import com.example.price_tracker.service.ProductService;
 import com.example.price_tracker.vo.ProductDetailVo;
 import com.example.price_tracker.vo.ProductPageVo;
+import com.example.price_tracker.vo.ProductPriceVo;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.springframework.http.MediaType;
@@ -86,6 +87,22 @@ class ProductControllerTest {
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.data.id").value(1L))
                 .andExpect(jsonPath("$.data.productName").value("Kindle"));
+    }
+
+    @Test
+    void shouldGetCurrentProductPrice() throws Exception {
+        ProductPriceVo priceVo = ProductPriceVo.builder()
+                .productId(1L)
+                .currentPrice(new BigDecimal("129.99"))
+                .currency("USD")
+                .build();
+        when(productService.getCurrentPrice(1L)).thenReturn(priceVo);
+
+        mockMvc.perform(get("/api/products/1/price"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.data.productId").value(1L))
+                .andExpect(jsonPath("$.data.currentPrice").value(129.99))
+                .andExpect(jsonPath("$.data.currency").value("USD"));
     }
 
     @Test

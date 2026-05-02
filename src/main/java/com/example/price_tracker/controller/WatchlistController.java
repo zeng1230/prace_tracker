@@ -5,6 +5,7 @@ import com.example.price_tracker.common.Result;
 import com.example.price_tracker.dto.WatchlistAddDto;
 import com.example.price_tracker.dto.WatchlistQueryDto;
 import com.example.price_tracker.dto.WatchlistUpdateDto;
+import com.example.price_tracker.redis.RateLimit;
 import com.example.price_tracker.service.WatchlistService;
 import com.example.price_tracker.vo.WatchlistVo;
 import jakarta.validation.Valid;
@@ -27,6 +28,7 @@ public class WatchlistController {
 
     private final WatchlistService watchlistService;
 
+    @RateLimit
     @PostMapping
     public Result<Long> add(@Valid @RequestBody WatchlistAddDto watchlistAddDto) {
         return Result.success(watchlistService.addWatchlist(watchlistAddDto));
@@ -37,12 +39,14 @@ public class WatchlistController {
         return Result.success(watchlistService.pageMyWatchlist(queryDto));
     }
 
+    @RateLimit
     @PutMapping("/{id}")
     public Result<Void> update(@PathVariable Long id, @Valid @RequestBody WatchlistUpdateDto watchlistUpdateDto) {
         watchlistService.updateWatchlist(id, watchlistUpdateDto);
         return Result.success();
     }
 
+    @RateLimit
     @DeleteMapping("/{id}")
     public Result<Void> delete(@PathVariable Long id) {
         watchlistService.deleteWatchlist(id);

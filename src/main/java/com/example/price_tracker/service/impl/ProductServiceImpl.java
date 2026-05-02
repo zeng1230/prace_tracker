@@ -9,27 +9,40 @@ import com.example.price_tracker.dto.ProductUpdateDto;
 import com.example.price_tracker.entity.Product;
 import com.example.price_tracker.exception.BusinessException;
 import com.example.price_tracker.mapper.ProductMapper;
+import com.example.price_tracker.redis.RedisCacheService;
+import com.example.price_tracker.redis.RedisDistributedLock;
+import com.example.price_tracker.redis.RedisKeyManager;
 import com.example.price_tracker.service.ProductService;
 import com.example.price_tracker.vo.ProductDetailVo;
 import com.example.price_tracker.vo.ProductPageVo;
+import com.example.price_tracker.vo.ProductPriceVo;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.apache.commons.lang3.StringUtils;
-import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.UUID;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class ProductServiceImpl implements ProductService {
 
-    private static final String PRODUCT_DETAIL_CACHE_KEY = "product:detail:";
     private static final int ACTIVE_STATUS = 1;
     private static final int DELETED_STATUS = 0;
+    private static final String NULL_CACHE_VALUE = "NULL";
+    private static final Duration CACHE_BASE_TTL = Duration.ofMinutes(30);
+    private static final Duration CACHE_TTL_JITTER = Duration.ofMinutes(5);
+    private static final Duration NULL_CACHE_TTL = Duration.ofMinutes(2);
+    private static final Duration LOCK_TTL = Duration.ofSeconds(10);
+    private static final Duration LOCK_RETRY_WAIT = Duration.ofMillis(50);
 
     private final ProductMapper productMapper;
-    private final RedisTemplate<String, Object> redisTemplate;
+    private final RedisCacheService cacheService;
+    private final RedisDistributedLock distributedLock;
 
     @Override
     public Long addProduct(ProductAddDto productAddDto) {
@@ -50,16 +63,34 @@ public class ProductServiceImpl implements ProductService {
 
     @Override
     public ProductDetailVo getProductDetail(Long id) {
-        String cacheKey = buildProductDetailCacheKey(id);
-        Object cachedValue = redisTemplate.opsForValue().get(cacheKey);
-        if (cachedValue instanceof ProductDetailVo productDetailVo) {
-            return productDetailVo;
+        String cacheKey = RedisKeyManager.productDetailKey(id);
+        String nullCacheKey = RedisKeyManager.nullValueKey("product:detail:" + id);
+        ProductDetailVo cached = cacheService.get(cacheKey, ProductDetailVo.class);
+        if (cached != null) {
+            log.info("cache hit, key={}", cacheKey);
+            return cached;
         }
+        log.info("cache miss, key={}", cacheKey);
+        if (isNullCacheHit(nullCacheKey)) {
+            throwProductNotFound();
+        }
+        return loadDetailWithLock(id, cacheKey, nullCacheKey);
+    }
 
-        Product product = getActiveProductOrThrow(id);
-        ProductDetailVo detailVo = toProductDetailVo(product);
-        redisTemplate.opsForValue().set(cacheKey, detailVo);
-        return detailVo;
+    @Override
+    public ProductPriceVo getCurrentPrice(Long id) {
+        String cacheKey = RedisKeyManager.productPriceKey(id);
+        String nullCacheKey = RedisKeyManager.nullValueKey("product:price:" + id);
+        ProductPriceVo cached = cacheService.get(cacheKey, ProductPriceVo.class);
+        if (cached != null) {
+            log.info("cache hit, key={}", cacheKey);
+            return cached;
+        }
+        log.info("cache miss, key={}", cacheKey);
+        if (isNullCacheHit(nullCacheKey)) {
+            throwProductNotFound();
+        }
+        return loadPriceWithLock(id, cacheKey, nullCacheKey);
     }
 
     @Override
@@ -92,7 +123,7 @@ public class ProductServiceImpl implements ProductService {
         existing.setImageUrl(productUpdateDto.getImageUrl());
         existing.setUpdatedAt(LocalDateTime.now());
         productMapper.updateById(existing);
-        clearProductDetailCache(id);
+        clearProductCache(id);
     }
 
     @Override
@@ -101,27 +132,127 @@ public class ProductServiceImpl implements ProductService {
         existing.setStatus(DELETED_STATUS);
         existing.setUpdatedAt(LocalDateTime.now());
         productMapper.updateById(existing);
-        clearProductDetailCache(id);
+        clearProductCache(id);
+    }
+
+    private ProductDetailVo loadDetailWithLock(Long id, String cacheKey, String nullCacheKey) {
+        String lockKey = RedisKeyManager.lockKey("product:detail:" + id);
+        String lockOwner = "product-detail-" + UUID.randomUUID();
+        if (!distributedLock.tryLock(lockKey, lockOwner, LOCK_TTL)) {
+            log.info("lock failed, key={}", lockKey);
+            waitBriefly();
+            ProductDetailVo cached = cacheService.get(cacheKey, ProductDetailVo.class);
+            if (cached != null) {
+                log.info("cache hit, key={}", cacheKey);
+                return cached;
+            }
+            if (isNullCacheHit(nullCacheKey)) {
+                throwProductNotFound();
+            }
+            throw new BusinessException(ResultCode.SYSTEM_ERROR, "product detail cache is rebuilding");
+        }
+
+        log.info("lock acquired, key={}", lockKey);
+        try {
+            ProductDetailVo cached = cacheService.get(cacheKey, ProductDetailVo.class);
+            if (cached != null) {
+                log.info("cache hit, key={}", cacheKey);
+                return cached;
+            }
+            Product product = productMapper.selectById(id);
+            log.info("db fallback, productId={}", id);
+            if (!isActiveProduct(product)) {
+                cacheService.set(nullCacheKey, NULL_CACHE_VALUE, NULL_CACHE_TTL);
+                throwProductNotFound();
+            }
+            ProductDetailVo detailVo = toProductDetailVo(product);
+            cacheService.set(cacheKey, detailVo, cacheService.randomTtl(CACHE_BASE_TTL, CACHE_TTL_JITTER));
+            return detailVo;
+        } finally {
+            distributedLock.unlock(lockKey, lockOwner);
+        }
+    }
+
+    private ProductPriceVo loadPriceWithLock(Long id, String cacheKey, String nullCacheKey) {
+        String lockKey = RedisKeyManager.lockKey("product:price:" + id);
+        String lockOwner = "product-price-" + UUID.randomUUID();
+        if (!distributedLock.tryLock(lockKey, lockOwner, LOCK_TTL)) {
+            log.info("lock failed, key={}", lockKey);
+            waitBriefly();
+            ProductPriceVo cached = cacheService.get(cacheKey, ProductPriceVo.class);
+            if (cached != null) {
+                log.info("cache hit, key={}", cacheKey);
+                return cached;
+            }
+            if (isNullCacheHit(nullCacheKey)) {
+                throwProductNotFound();
+            }
+            throw new BusinessException(ResultCode.SYSTEM_ERROR, "product price cache is rebuilding");
+        }
+
+        log.info("lock acquired, key={}", lockKey);
+        try {
+            ProductPriceVo cached = cacheService.get(cacheKey, ProductPriceVo.class);
+            if (cached != null) {
+                log.info("cache hit, key={}", cacheKey);
+                return cached;
+            }
+            Product product = productMapper.selectById(id);
+            log.info("db fallback, productId={}", id);
+            if (!isActiveProduct(product)) {
+                cacheService.set(nullCacheKey, NULL_CACHE_VALUE, NULL_CACHE_TTL);
+                throwProductNotFound();
+            }
+            ProductPriceVo priceVo = toProductPriceVo(product);
+            cacheService.set(cacheKey, priceVo, cacheService.randomTtl(CACHE_BASE_TTL, CACHE_TTL_JITTER));
+            return priceVo;
+        } finally {
+            distributedLock.unlock(lockKey, lockOwner);
+        }
     }
 
     private Product getActiveProductOrThrow(Long id) {
         Product product = productMapper.selectById(id);
-        if (product == null || !isActiveStatus(product.getStatus())) {
+        if (!isActiveProduct(product)) {
             throw new BusinessException(ResultCode.NOT_FOUND, "product not found");
         }
         return product;
+    }
+
+    private boolean isActiveProduct(Product product) {
+        return product != null && isActiveStatus(product.getStatus());
     }
 
     private boolean isActiveStatus(Integer status) {
         return status != null && status == ACTIVE_STATUS;
     }
 
-    private void clearProductDetailCache(Long id) {
-        redisTemplate.delete(buildProductDetailCacheKey(id));
+    private boolean isNullCacheHit(String nullCacheKey) {
+        boolean hit = NULL_CACHE_VALUE.equals(cacheService.get(nullCacheKey, String.class));
+        if (hit) {
+            log.info("null cache hit, key={}", nullCacheKey);
+        }
+        return hit;
     }
 
-    private String buildProductDetailCacheKey(Long id) {
-        return PRODUCT_DETAIL_CACHE_KEY + id;
+    private void throwProductNotFound() {
+        throw new BusinessException(ResultCode.NOT_FOUND, "product not found");
+    }
+
+    private void waitBriefly() {
+        try {
+            Thread.sleep(LOCK_RETRY_WAIT.toMillis());
+        } catch (InterruptedException exception) {
+            Thread.currentThread().interrupt();
+            throw new BusinessException(ResultCode.SYSTEM_ERROR, "cache retry interrupted");
+        }
+    }
+
+    private void clearProductCache(Long id) {
+        cacheService.delete(RedisKeyManager.productDetailKey(id));
+        cacheService.delete(RedisKeyManager.productPriceKey(id));
+        cacheService.delete(RedisKeyManager.nullValueKey("product:detail:" + id));
+        cacheService.delete(RedisKeyManager.nullValueKey("product:price:" + id));
     }
 
     private ProductDetailVo toProductDetailVo(Product product) {
@@ -150,6 +281,15 @@ public class ProductServiceImpl implements ProductService {
                 .imageUrl(product.getImageUrl())
                 .lastCheckedAt(product.getLastCheckedAt())
                 .updatedAt(product.getUpdatedAt())
+                .build();
+    }
+
+    private ProductPriceVo toProductPriceVo(Product product) {
+        return ProductPriceVo.builder()
+                .productId(product.getId())
+                .currentPrice(product.getCurrentPrice())
+                .currency(product.getCurrency())
+                .lastCheckedAt(product.getLastCheckedAt())
                 .build();
     }
 }

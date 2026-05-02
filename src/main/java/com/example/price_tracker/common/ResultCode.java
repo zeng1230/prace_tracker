@@ -10,6 +10,7 @@ public enum ResultCode {
     UNAUTHORIZED(401, "unauthorized"),
     FORBIDDEN(403, "forbidden"),
     NOT_FOUND(404, "not found"),
+    TOO_MANY_REQUESTS(429, "too many requests"),
     VALIDATE_ERROR(422, "validation error"),
     SYSTEM_ERROR(500, "system error");
 
