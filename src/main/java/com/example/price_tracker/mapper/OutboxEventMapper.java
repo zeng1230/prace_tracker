@@ -104,8 +104,12 @@ public interface OutboxEventMapper extends BaseMapper<OutboxEvent> {
                 claimed_until = NULL,
                 updated_at = #{now}
             WHERE id = #{id}
+              AND claim_owner = #{claimOwner}
+              AND status IN ('PENDING', 'FAILED_RETRYABLE')
             """)
-    int markSent(@Param("id") Long id, @Param("now") LocalDateTime now);
+    int markSent(@Param("id") Long id,
+                 @Param("claimOwner") String claimOwner,
+                 @Param("now") LocalDateTime now);
 
     @Update("""
             UPDATE tb_outbox_event
@@ -118,8 +122,11 @@ public interface OutboxEventMapper extends BaseMapper<OutboxEvent> {
                 claimed_until = NULL,
                 updated_at = #{now}
             WHERE id = #{id}
+              AND claim_owner = #{claimOwner}
+              AND status IN ('PENDING', 'FAILED_RETRYABLE')
             """)
     int markRetryable(@Param("id") Long id,
+                      @Param("claimOwner") String claimOwner,
                       @Param("attempts") Integer attempts,
                       @Param("nextRetryAt") LocalDateTime nextRetryAt,
                       @Param("lastError") String lastError,
@@ -135,8 +142,11 @@ public interface OutboxEventMapper extends BaseMapper<OutboxEvent> {
                 claimed_until = NULL,
                 updated_at = #{now}
             WHERE id = #{id}
+              AND claim_owner = #{claimOwner}
+              AND status IN ('PENDING', 'FAILED_RETRYABLE')
             """)
     int markDead(@Param("id") Long id,
+                 @Param("claimOwner") String claimOwner,
                  @Param("attempts") Integer attempts,
                  @Param("lastError") String lastError,
                  @Param("now") LocalDateTime now);

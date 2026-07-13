@@ -59,10 +59,12 @@ class NotificationDeliveryRelayTest {
         when(notificationDeliveryMapper.selectClaimedReadyDeliveries(eq("test-delivery-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(delivery));
         when(webhookDeliveryClient.send(delivery)).thenReturn(WebhookDeliveryResult.success(202));
+        when(notificationDeliveryMapper.markSent(eq(1L), eq("test-delivery-relay"), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         relay.relayPendingDeliveries();
 
-        verify(notificationDeliveryMapper).markSent(eq(1L), any(LocalDateTime.class));
+        verify(notificationDeliveryMapper).markSent(eq(1L), eq("test-delivery-relay"), any(LocalDateTime.class));
     }
 
     @Test
@@ -73,10 +75,12 @@ class NotificationDeliveryRelayTest {
         when(notificationDeliveryMapper.selectClaimedReadyDeliveries(eq("test-delivery-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(delivery));
         when(webhookDeliveryClient.send(delivery)).thenReturn(WebhookDeliveryResult.dead("webhook client error status=400"));
+        when(notificationDeliveryMapper.markDead(eq(2L), eq("test-delivery-relay"), eq(1), eq("webhook client error status=400"), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         relay.relayPendingDeliveries();
 
-        verify(notificationDeliveryMapper).markDead(eq(2L), eq(1), eq("webhook client error status=400"), any(LocalDateTime.class));
+        verify(notificationDeliveryMapper).markDead(eq(2L), eq("test-delivery-relay"), eq(1), eq("webhook client error status=400"), any(LocalDateTime.class));
     }
 
     @Test
@@ -87,11 +91,13 @@ class NotificationDeliveryRelayTest {
         when(notificationDeliveryMapper.selectClaimedReadyDeliveries(eq("test-delivery-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(delivery));
         when(webhookDeliveryClient.send(delivery)).thenReturn(WebhookDeliveryResult.retryable("webhook server error status=500"));
+        when(notificationDeliveryMapper.markRetryable(eq(3L), eq("test-delivery-relay"), eq(2), any(LocalDateTime.class), eq("webhook server error status=500"), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         relay.relayPendingDeliveries();
 
         ArgumentCaptor<LocalDateTime> retryAtCaptor = ArgumentCaptor.forClass(LocalDateTime.class);
-        verify(notificationDeliveryMapper).markRetryable(eq(3L), eq(2), retryAtCaptor.capture(), eq("webhook server error status=500"), any(LocalDateTime.class));
+        verify(notificationDeliveryMapper).markRetryable(eq(3L), eq("test-delivery-relay"), eq(2), retryAtCaptor.capture(), eq("webhook server error status=500"), any(LocalDateTime.class));
         assertThat(retryAtCaptor.getValue()).isAfter(LocalDateTime.now());
     }
 
@@ -104,6 +110,21 @@ class NotificationDeliveryRelayTest {
 
         verify(notificationDeliveryMapper, never()).selectClaimedReadyDeliveries(any(), any(), any(Integer.class));
         verify(webhookDeliveryClient, never()).send(any());
+    }
+
+    @Test
+    void relayDoesNotRecordSuccessWhenOwnershipIsLostBeforeMarkSent() {
+        NotificationDelivery delivery = delivery(4L, 0);
+        when(notificationDeliveryMapper.claimReadyDeliveries(any(), any(LocalDateTime.class), eq(20), eq("test-delivery-relay"), any(LocalDateTime.class)))
+                .thenReturn(1);
+        when(notificationDeliveryMapper.selectClaimedReadyDeliveries(eq("test-delivery-relay"), any(LocalDateTime.class), eq(20)))
+                .thenReturn(List.of(delivery));
+        when(webhookDeliveryClient.send(delivery)).thenReturn(WebhookDeliveryResult.success(202));
+        when(notificationDeliveryMapper.markSent(eq(4L), eq("test-delivery-relay"), any(LocalDateTime.class))).thenReturn(0);
+
+        relay.relayPendingDeliveries();
+
+        verify(metrics, never()).recordNotificationDelivery(PriceTrackerMetrics.RESULT_SUCCESS);
     }
 
     private NotificationDelivery delivery(Long id, int attempts) {

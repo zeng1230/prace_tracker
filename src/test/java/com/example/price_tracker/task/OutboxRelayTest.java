@@ -66,10 +66,11 @@ class OutboxRelayTest {
                 .thenReturn(List.of(event));
         when(priceAlertProducer.send(any(PriceAlertMessage.class))).thenReturn(correlationData);
         when(priceAlertProducer.isReturned(event.getEventKey())).thenReturn(false);
+        when(outboxEventMapper.markSent(eq(1L), eq("test-outbox-relay"), any(LocalDateTime.class))).thenReturn(1);
 
         outboxRelay.relayPendingEvents();
 
-        verify(outboxEventMapper).markSent(eq(1L), any(LocalDateTime.class));
+        verify(outboxEventMapper).markSent(eq(1L), eq("test-outbox-relay"), any(LocalDateTime.class));
         verify(priceAlertProducer).clearReturned(event.getEventKey());
     }
 
@@ -82,11 +83,13 @@ class OutboxRelayTest {
                 .thenReturn(List.of(event));
         when(priceAlertProducer.send(any(PriceAlertMessage.class))).thenReturn(ackCorrelationData(event.getEventKey()));
         when(priceAlertProducer.isReturned(event.getEventKey())).thenReturn(true);
+        when(outboxEventMapper.markDead(eq(2L), eq("test-outbox-relay"), eq(1), any(String.class), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         outboxRelay.relayPendingEvents();
 
-        verify(outboxEventMapper).markDead(eq(2L), eq(1), any(String.class), any(LocalDateTime.class));
-        verify(outboxEventMapper, never()).markSent(any(), any());
+        verify(outboxEventMapper).markDead(eq(2L), eq("test-outbox-relay"), eq(1), any(String.class), any(LocalDateTime.class));
+        verify(outboxEventMapper, never()).markSent(any(), any(), any());
     }
 
     @Test
@@ -96,11 +99,13 @@ class OutboxRelayTest {
                 .thenReturn(1);
         when(outboxEventMapper.selectClaimedReadyEvents(eq("test-outbox-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(event));
+        when(outboxEventMapper.markDead(eq(3L), eq("test-outbox-relay"), eq(1), any(String.class), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         outboxRelay.relayPendingEvents();
 
         verify(priceAlertProducer, never()).send(any());
-        verify(outboxEventMapper).markDead(eq(3L), eq(1), any(String.class), any(LocalDateTime.class));
+        verify(outboxEventMapper).markDead(eq(3L), eq("test-outbox-relay"), eq(1), any(String.class), any(LocalDateTime.class));
     }
 
     @Test
@@ -111,11 +116,13 @@ class OutboxRelayTest {
         when(outboxEventMapper.selectClaimedReadyEvents(eq("test-outbox-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(event));
         when(priceAlertProducer.send(any(PriceAlertMessage.class))).thenReturn(nackCorrelationData(event.getEventKey()));
+        when(outboxEventMapper.markRetryable(eq(4L), eq("test-outbox-relay"), eq(2), any(LocalDateTime.class), any(String.class), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         outboxRelay.relayPendingEvents();
 
         ArgumentCaptor<LocalDateTime> retryAtCaptor = ArgumentCaptor.forClass(LocalDateTime.class);
-        verify(outboxEventMapper).markRetryable(eq(4L), eq(2), retryAtCaptor.capture(), any(String.class), any(LocalDateTime.class));
+        verify(outboxEventMapper).markRetryable(eq(4L), eq("test-outbox-relay"), eq(2), retryAtCaptor.capture(), any(String.class), any(LocalDateTime.class));
         assertThat(retryAtCaptor.getValue()).isAfter(LocalDateTime.now());
     }
 
@@ -127,11 +134,13 @@ class OutboxRelayTest {
         when(outboxEventMapper.selectClaimedReadyEvents(eq("test-outbox-relay"), any(LocalDateTime.class), eq(20)))
                 .thenReturn(List.of(event));
         when(priceAlertProducer.send(any(PriceAlertMessage.class))).thenReturn(nackCorrelationData(event.getEventKey()));
+        when(outboxEventMapper.markDead(eq(5L), eq("test-outbox-relay"), eq(5), any(String.class), any(LocalDateTime.class)))
+                .thenReturn(1);
 
         outboxRelay.relayPendingEvents();
 
-        verify(outboxEventMapper).markDead(eq(5L), eq(5), any(String.class), any(LocalDateTime.class));
-        verify(outboxEventMapper, never()).markRetryable(any(), any(), any(), any(), any());
+        verify(outboxEventMapper).markDead(eq(5L), eq("test-outbox-relay"), eq(5), any(String.class), any(LocalDateTime.class));
+        verify(outboxEventMapper, never()).markRetryable(any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -143,6 +152,22 @@ class OutboxRelayTest {
 
         verify(outboxEventMapper, never()).selectClaimedReadyEvents(any(), any(), any(Integer.class));
         verify(priceAlertProducer, never()).send(any());
+    }
+
+    @Test
+    void relayDoesNotRecordSuccessWhenOwnershipIsLostBeforeMarkSent() throws Exception {
+        OutboxEvent event = outboxEvent(6, 0, objectMapper.writeValueAsString(priceAlertMessage()));
+        when(outboxEventMapper.claimReadyEvents(any(), any(LocalDateTime.class), eq(20), eq("test-outbox-relay"), any(LocalDateTime.class)))
+                .thenReturn(1);
+        when(outboxEventMapper.selectClaimedReadyEvents(eq("test-outbox-relay"), any(LocalDateTime.class), eq(20)))
+                .thenReturn(List.of(event));
+        when(priceAlertProducer.send(any(PriceAlertMessage.class))).thenReturn(ackCorrelationData(event.getEventKey()));
+        when(priceAlertProducer.isReturned(event.getEventKey())).thenReturn(false);
+        when(outboxEventMapper.markSent(eq(6L), eq("test-outbox-relay"), any(LocalDateTime.class))).thenReturn(0);
+
+        outboxRelay.relayPendingEvents();
+
+        verify(metrics, never()).recordOutboxRelay(PriceTrackerMetrics.RESULT_SUCCESS);
     }
 
     private CorrelationData ackCorrelationData(String eventKey) {

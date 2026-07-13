@@ -69,9 +69,4 @@ out/
 
 .gitignore
 /docs/*
-!/docs/AGENTS.md
-!/docs/API_CONTRACT.md
-!/docs/DOCS_INDEX.md
-!/docs/PERFORMANCE_BASELINE.md
-!/docs/RELEASE_CANDIDATE_ACCEPTANCE.md
 .docker-java.properties

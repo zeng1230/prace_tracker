@@ -108,7 +108,11 @@ public class OutboxRelay {
                 return;
             }
             if (confirm.isAck()) {
-                outboxEventMapper.markSent(event.getId(), LocalDateTime.now());
+                int updated = outboxEventMapper.markSent(event.getId(), relayInstanceId, LocalDateTime.now());
+                if (updated == 0) {
+                    logOwnershipLost(event, "markSent");
+                    return;
+                }
                 metrics.recordOutboxRelay(PriceTrackerMetrics.RESULT_SUCCESS);
                 log.info("outbox event published, eventKey={}, id={}", eventKey, event.getId());
                 return;
@@ -133,12 +137,17 @@ public class OutboxRelay {
         }
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime nextRetryAt = now.plusSeconds(backoffSeconds(nextAttempts));
-        outboxEventMapper.markRetryable(
+        int updated = outboxEventMapper.markRetryable(
                 event.getId(),
+                relayInstanceId,
                 nextAttempts,
                 nextRetryAt,
                 truncate(error),
                 now);
+        if (updated == 0) {
+            logOwnershipLost(event, "markRetryable");
+            return;
+        }
         metrics.recordOutboxRelay(PriceTrackerMetrics.RESULT_FAILED);
         log.warn("outbox event publish failed, eventKey={}, id={}, attempts={}, nextRetryAt={}, error={}",
                 event.getEventKey(), event.getId(), nextAttempts, nextRetryAt, error);
@@ -146,10 +155,20 @@ public class OutboxRelay {
 
     private void markDead(OutboxEvent event, String error) {
         int nextAttempts = normalizeAttempts(event) + 1;
-        outboxEventMapper.markDead(event.getId(), nextAttempts, truncate(error), LocalDateTime.now());
+        int updated = outboxEventMapper.markDead(
+                event.getId(), relayInstanceId, nextAttempts, truncate(error), LocalDateTime.now());
+        if (updated == 0) {
+            logOwnershipLost(event, "markDead");
+            return;
+        }
         metrics.recordOutboxRelay("dead");
         log.error("outbox event marked dead, eventKey={}, id={}, attempts={}, error={}",
                 event.getEventKey(), event.getId(), nextAttempts, error);
+    }
+
+    private void logOwnershipLost(OutboxEvent event, String operation) {
+        log.warn("outbox event ownership lost before state update, operation={}, eventKey={}, id={}, claimOwner={}",
+                operation, event.getEventKey(), event.getId(), relayInstanceId);
     }
 
     private int normalizeAttempts(OutboxEvent event) {

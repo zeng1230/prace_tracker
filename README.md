@@ -247,9 +247,9 @@ docker build -t price-tracker:local .
 
 ## 关联文档
 
+- [docs/PROJECT_STATE_AUDIT.md](docs/PROJECT_STATE_AUDIT.md)
+- [docs/CODEX_NEXT_CONTEXT.md](docs/CODEX_NEXT_CONTEXT.md)
 - [docs/DOCS_INDEX.md](docs/DOCS_INDEX.md)
 - [docs/RELEASE_CANDIDATE_ACCEPTANCE.md](docs/RELEASE_CANDIDATE_ACCEPTANCE.md)
 - [docs/API_CONTRACT.md](docs/API_CONTRACT.md)
-- [docs/RUNBOOK.md](docs/RUNBOOK.md)
 - [docs/PERFORMANCE_BASELINE.md](docs/PERFORMANCE_BASELINE.md)
-- [docs/production_readiness_analysis.md](docs/production_readiness_analysis.md)

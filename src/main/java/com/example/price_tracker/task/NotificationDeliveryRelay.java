@@ -94,7 +94,11 @@ public class NotificationDeliveryRelay {
         }
 
         if (result.success()) {
-            notificationDeliveryMapper.markSent(delivery.getId(), LocalDateTime.now());
+            int updated = notificationDeliveryMapper.markSent(delivery.getId(), relayInstanceId, LocalDateTime.now());
+            if (updated == 0) {
+                logOwnershipLost(delivery, "markSent");
+                return;
+            }
             metrics.recordNotificationDelivery(PriceTrackerMetrics.RESULT_SUCCESS);
             log.info("notification delivery sent, id={}, eventKey={}, channel={}",
                     delivery.getId(), delivery.getEventKey(), delivery.getChannel());
@@ -106,7 +110,12 @@ public class NotificationDeliveryRelay {
     private void markFailure(NotificationDelivery delivery, String error, boolean retryable) {
         int nextAttempts = normalizeAttempts(delivery) + 1;
         if (!retryable || nextAttempts >= maxAttempts) {
-            notificationDeliveryMapper.markDead(delivery.getId(), nextAttempts, truncate(error), LocalDateTime.now());
+            int updated = notificationDeliveryMapper.markDead(
+                    delivery.getId(), relayInstanceId, nextAttempts, truncate(error), LocalDateTime.now());
+            if (updated == 0) {
+                logOwnershipLost(delivery, "markDead");
+                return;
+            }
             metrics.recordNotificationDelivery("dead");
             log.warn("notification delivery marked dead, id={}, eventKey={}, attempts={}, error={}",
                     delivery.getId(), delivery.getEventKey(), nextAttempts, error);
@@ -114,10 +123,20 @@ public class NotificationDeliveryRelay {
         }
         LocalDateTime now = LocalDateTime.now();
         LocalDateTime nextRetryAt = now.plusSeconds(backoffSeconds(nextAttempts));
-        notificationDeliveryMapper.markRetryable(delivery.getId(), nextAttempts, nextRetryAt, truncate(error), now);
+        int updated = notificationDeliveryMapper.markRetryable(
+                delivery.getId(), relayInstanceId, nextAttempts, nextRetryAt, truncate(error), now);
+        if (updated == 0) {
+            logOwnershipLost(delivery, "markRetryable");
+            return;
+        }
         metrics.recordNotificationDelivery(PriceTrackerMetrics.RESULT_FAILED);
         log.warn("notification delivery failed, id={}, eventKey={}, attempts={}, nextRetryAt={}, error={}",
                 delivery.getId(), delivery.getEventKey(), nextAttempts, nextRetryAt, error);
+    }
+
+    private void logOwnershipLost(NotificationDelivery delivery, String operation) {
+        log.warn("notification delivery ownership lost before state update, operation={}, id={}, eventKey={}, claimOwner={}",
+                operation, delivery.getId(), delivery.getEventKey(), relayInstanceId);
     }
 
     private int resolveBatchSize() {
