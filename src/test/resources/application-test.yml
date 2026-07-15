@@ -12,6 +12,14 @@ spring:
         auto-startup: false
 
 management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  endpoint:
+    health:
+      show-components: never
+      show-details: never
   health:
     rabbit:
       enabled: false

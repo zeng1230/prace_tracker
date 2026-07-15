@@ -185,18 +185,25 @@ Redis 主要用于：
 
 ## 可观测性
 
-默认 Profile 仅暴露健康状态：
+默认和 `prod` Profile 仅公开健康状态；健康响应不返回组件与连接详情：
 
 ```http
 GET /actuator/health
+GET /actuator/health/liveness
+GET /actuator/health/readiness
 ```
 
-`prod` Profile 额外暴露：
+`dev`/`local` 显式开放 `health,info,metrics,prometheus` 并显示详细健康信息。`test` 显式开放
+`health,prometheus`，但隐藏健康详情，以支持自动化验证。
+
+生产环境只有在同时启用 `prod-prometheus` Profile 时才开放 Prometheus：
 
 ```http
-GET /actuator/health
 GET /actuator/prometheus
 ```
+
+`prod-prometheus` 是抓取能力开关，不是访问控制。仓库没有反向代理、网络策略或 Spring Security
+规则保护该路径，因此部署方必须确保它只可从监控内网访问；不能将其直接暴露到公网。
 
 关键指标名称包括：
 
@@ -210,7 +217,7 @@ GET /actuator/prometheus
 - `notification_delivery_total`
 - `rate_limit_block_total`
 
-应用程序能提供 Prometheus 格式 of 指标，但本仓库并不包含生产环境下的 Prometheus 抓取配置、Grafana 仪表盘或报警规则。
+应用程序能提供 Prometheus 格式的指标，但本仓库并不包含生产环境下的 Prometheus 抓取配置、网络访问控制、Grafana 仪表盘或报警规则。
 
 ## 生产 Profile 配置防线
 

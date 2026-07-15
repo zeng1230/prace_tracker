@@ -1,0 +1,6 @@
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+        exclude: env,configprops,beans,mappings,heapdump,threaddump,loggers,shutdown,caches,scheduledtasks,startup

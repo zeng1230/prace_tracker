@@ -53,7 +53,10 @@ management:
         include: health
   endpoint:
     health:
-      show-details: always
+      probes:
+        enabled: true
+      show-components: never
+      show-details: never
 
 logging:
   pattern:
