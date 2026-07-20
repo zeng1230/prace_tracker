@@ -3,6 +3,7 @@ package com.example.price_tracker.service.impl;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.example.price_tracker.common.PageResult;
 import com.example.price_tracker.common.ResultCode;
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.context.UserContext;
 import com.example.price_tracker.dto.NotificationQueryDto;
 import com.example.price_tracker.entity.Notification;
@@ -22,7 +23,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.apache.commons.lang3.StringUtils;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -53,9 +53,7 @@ public class NotificationServiceImpl implements NotificationService {
     private final WatchlistMapper watchlistMapper;
     private final NotificationDeliveryMapper notificationDeliveryMapper;
     private final ObjectMapper objectMapper;
-
-    @Value("${notification.webhook.enabled:false}")
-    private boolean webhookEnabled = false;
+    private final NotificationProperties notificationProperties;
 
     @Override
     public PageResult<NotificationVo> pageMyNotifications(NotificationQueryDto queryDto) {
@@ -169,7 +167,7 @@ public class NotificationServiceImpl implements NotificationService {
     }
 
     private void createWebhookDeliveryIfEnabled(PriceAlertMessage message, LocalDateTime now) {
-        if (!webhookEnabled) {
+        if (!notificationProperties.getWebhook().isEnabled()) {
             return;
         }
         NotificationDelivery delivery = NotificationDelivery.builder()

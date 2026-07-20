@@ -1,5 +1,6 @@
 package com.example.price_tracker.task;
 
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.entity.NotificationDelivery;
 import com.example.price_tracker.entity.NotificationDeliveryStatus;
 import com.example.price_tracker.mapper.NotificationDeliveryMapper;
@@ -37,18 +38,21 @@ class NotificationDeliveryRelayTest {
     private PriceTrackerMetrics metrics;
 
     private NotificationDeliveryRelay relay;
+    private NotificationProperties notificationProperties;
 
     @BeforeEach
     void setUp() {
-        relay = new NotificationDeliveryRelay(notificationDeliveryMapper, webhookDeliveryClient, metrics);
-        ReflectionTestUtils.setField(relay, "batchSize", 20);
-        ReflectionTestUtils.setField(relay, "maxAttempts", 3);
-        ReflectionTestUtils.setField(relay, "initialBackoffSeconds", 5L);
-        ReflectionTestUtils.setField(relay, "maxBackoffSeconds", 300L);
-        ReflectionTestUtils.setField(relay, "claimLeaseSeconds", 120L);
+        notificationProperties = new NotificationProperties();
+        notificationProperties.getDelivery().setBatchSize(20);
+        notificationProperties.getDelivery().setMaxAttempts(3);
+        notificationProperties.getDelivery().setInitialBackoffSeconds(5L);
+        notificationProperties.getDelivery().setMaxBackoffSeconds(300L);
+        notificationProperties.getDelivery().setClaimLeaseSeconds(120L);
+        notificationProperties.getDelivery().setEnabled(true);
+        notificationProperties.getWebhook().setEnabled(true);
+        relay = new NotificationDeliveryRelay(
+                notificationDeliveryMapper, webhookDeliveryClient, metrics, notificationProperties);
         ReflectionTestUtils.setField(relay, "relayInstanceId", "test-delivery-relay");
-        ReflectionTestUtils.setField(relay, "relayEnabled", true);
-        ReflectionTestUtils.setField(relay, "webhookEnabled", true);
     }
 
     @Test

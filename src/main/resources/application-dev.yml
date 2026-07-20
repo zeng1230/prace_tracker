@@ -7,3 +7,7 @@ management:
     health:
       show-components: always
       show-details: always
+
+notification:
+  webhook:
+    allow-http: true

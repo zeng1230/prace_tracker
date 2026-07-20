@@ -1,19 +1,24 @@
 package com.example.price_tracker.notification;
 
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.entity.NotificationDelivery;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
-import org.springframework.test.util.ReflectionTestUtils;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.HexFormat;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
 class DefaultWebhookDeliveryClientTest {
+
+    private static final String TEST_SECRET = "0123456789abcdef0123456789abcdef";
 
     private HttpServer server;
 
@@ -29,20 +34,22 @@ class DefaultWebhookDeliveryClientTest {
         AtomicReference<String> receivedBody = new AtomicReference<>();
         AtomicReference<String> receivedSignature = new AtomicReference<>();
         server = startServer(202, receivedBody, receivedSignature);
-        DefaultWebhookDeliveryClient client = client("http://127.0.0.1:" + server.getAddress().getPort() + "/hook", "secret-123");
+        DefaultWebhookDeliveryClient client = client(
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/hook", TEST_SECRET);
 
         WebhookDeliveryResult result = client.send(delivery("{\"eventKey\":\"abc\"}"));
 
         assertThat(result.success()).isTrue();
         assertThat(result.statusCode()).isEqualTo(202);
         assertThat(receivedBody.get()).isEqualTo("{\"eventKey\":\"abc\"}");
-        assertThat(receivedSignature.get()).isNotBlank().startsWith("sha256=");
+        assertThat(receivedSignature.get()).isEqualTo(signature(TEST_SECRET, "{\"eventKey\":\"abc\"}"));
     }
 
     @Test
     void sendClassifiesServerErrorAsRetryable() throws Exception {
         server = startServer(500, new AtomicReference<>(), new AtomicReference<>());
-        DefaultWebhookDeliveryClient client = client("http://127.0.0.1:" + server.getAddress().getPort() + "/hook", "secret-123");
+        DefaultWebhookDeliveryClient client = client(
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/hook", TEST_SECRET);
 
         WebhookDeliveryResult result = client.send(delivery("{}"));
 
@@ -54,13 +61,28 @@ class DefaultWebhookDeliveryClientTest {
     @Test
     void sendClassifiesClientErrorAsDead() throws Exception {
         server = startServer(400, new AtomicReference<>(), new AtomicReference<>());
-        DefaultWebhookDeliveryClient client = client("http://127.0.0.1:" + server.getAddress().getPort() + "/hook", "secret-123");
+        DefaultWebhookDeliveryClient client = client(
+                "http://127.0.0.1:" + server.getAddress().getPort() + "/hook", TEST_SECRET);
 
         WebhookDeliveryResult result = client.send(delivery("{}"));
 
         assertThat(result.success()).isFalse();
         assertThat(result.retryable()).isFalse();
         assertThat(result.error()).contains("status=400");
+    }
+
+    @Test
+    void requestFailureDoesNotExposeSensitiveUrlContent() {
+        String sensitiveUrl = "http://127.0.0.1:1/hook?token=must-not-appear";
+        DefaultWebhookDeliveryClient client = client(sensitiveUrl, TEST_SECRET);
+
+        WebhookDeliveryResult result = client.send(delivery("{}"));
+
+        assertThat(result.success()).isFalse();
+        assertThat(result.retryable()).isTrue();
+        assertThat(result.error())
+                .contains("webhook request failed")
+                .doesNotContain(sensitiveUrl, "must-not-appear");
     }
 
     private HttpServer startServer(int status,
@@ -78,11 +100,12 @@ class DefaultWebhookDeliveryClientTest {
     }
 
     private DefaultWebhookDeliveryClient client(String url, String secret) {
-        DefaultWebhookDeliveryClient client = new DefaultWebhookDeliveryClient();
-        ReflectionTestUtils.setField(client, "webhookUrl", url);
-        ReflectionTestUtils.setField(client, "webhookSecret", secret);
-        ReflectionTestUtils.setField(client, "timeoutMillis", 1000L);
-        return client;
+        NotificationProperties properties = new NotificationProperties();
+        properties.getWebhook().setUrl(url);
+        properties.getWebhook().setSecret(secret);
+        properties.getWebhook().setConnectTimeoutMs(1000L);
+        properties.getWebhook().setReadTimeoutMs(1000L);
+        return new DefaultWebhookDeliveryClient(properties);
     }
 
     private NotificationDelivery delivery(String payload) {
@@ -92,5 +115,11 @@ class DefaultWebhookDeliveryClientTest {
                 .channel("WEBHOOK")
                 .payload(payload)
                 .build();
+    }
+
+    private String signature(String secret, String payload) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(secret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        return "sha256=" + HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
     }
 }

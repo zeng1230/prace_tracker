@@ -15,7 +15,8 @@ class ProductionConfigValidatorTest {
                 .withProperty("spring.datasource.password", "db-secret")
                 .withProperty("spring.rabbitmq.password", "mq-secret");
 
-        ProductionConfigValidator validator = new ProductionConfigValidator(environment, jwtProperties);
+        ProductionConfigValidator validator = new ProductionConfigValidator(
+                environment, jwtProperties, new NotificationProperties());
 
         assertThatThrownBy(validator::validate)
                 .isInstanceOf(IllegalStateException.class)
@@ -29,7 +30,8 @@ class ProductionConfigValidatorTest {
                 .withProperty("spring.datasource.password", "db-secret")
                 .withProperty("spring.rabbitmq.password", "mq-secret");
 
-        ProductionConfigValidator validator = new ProductionConfigValidator(environment, jwtProperties);
+        ProductionConfigValidator validator = new ProductionConfigValidator(
+                environment, jwtProperties, new NotificationProperties());
 
         assertThatCode(validator::validate).doesNotThrowAnyException();
     }

@@ -161,6 +161,22 @@ price-provider:
 
 `NotificationServiceImpl` 在消费 RabbitMQ 消息后创建应用内通知。如果启用了 Webhook，还会插入一条 `tb_notification_delivery` 记录。`NotificationDeliveryRelay` 负责认领交付任务，将 HTTP POST 请求发送到配置的 Webhook URL；在配置了密钥时使用 `X-Price-Tracker-Signature` 对 Payload 进行签名，并将状态相应地标记为 `SENT`、`FAILED_RETRYABLE` 或 `DEAD`。
 
+Webhook 默认关闭。启用时必须提供有效 URL 和至少 32 字符的非占位签名密钥；超时和 Delivery
+重试参数也会在应用启动阶段校验。生产环境只允许 HTTPS，配置错误会阻止应用启动，且错误信息
+不会回显密钥内容：
+
+```powershell
+$env:WEBHOOK_ENABLED="true"
+$env:WEBHOOK_URL="https://webhook.example.invalid/price-alerts"
+$env:WEBHOOK_SECRET="<random-secret-with-at-least-32-characters>"
+$env:WEBHOOK_CONNECT_TIMEOUT_MS="3000"
+$env:WEBHOOK_READ_TIMEOUT_MS="3000"
+```
+
+`dev`、`local`、`test` 和 `it` profile 显式允许 HTTP，便于连接本地测试服务器；默认 profile
+与 `prod` 不允许 HTTP。`notification.delivery.enabled=false` 可暂停 Relay，但不会关闭 Webhook
+Delivery 记录的创建。
+
 管理员恢复端点：
 
 ```http

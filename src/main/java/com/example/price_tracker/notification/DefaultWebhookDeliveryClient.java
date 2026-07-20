@@ -1,8 +1,9 @@
 package com.example.price_tracker.notification;
 
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.entity.NotificationDelivery;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 
 import javax.crypto.Mac;
@@ -17,32 +18,31 @@ import java.util.HexFormat;
 
 @Slf4j
 @Component
+@RequiredArgsConstructor
 public class DefaultWebhookDeliveryClient implements WebhookDeliveryClient {
 
-    @Value("${notification.webhook.url:}")
-    private String webhookUrl;
-
-    @Value("${notification.webhook.secret:}")
-    private String webhookSecret;
-
-    @Value("${notification.webhook.timeout-ms:3000}")
-    private long timeoutMillis = 3000;
+    private final NotificationProperties notificationProperties;
 
     @Override
     public WebhookDeliveryResult send(NotificationDelivery delivery) {
+        NotificationProperties.Webhook webhook = notificationProperties.getWebhook();
+        String webhookUrl = webhook.getUrl();
         if (webhookUrl == null || webhookUrl.isBlank()) {
             return WebhookDeliveryResult.dead("webhook url is blank");
         }
         try {
             String payload = delivery.getPayload();
             HttpRequest request = HttpRequest.newBuilder(URI.create(webhookUrl))
-                    .timeout(Duration.ofMillis(resolveTimeoutMillis()))
+                    .timeout(Duration.ofMillis(webhook.resolveReadTimeoutMs()))
                     .header("Content-Type", "application/json")
                     .header("X-Price-Tracker-Event-Key", delivery.getEventKey())
                     .header("X-Price-Tracker-Signature", signature(payload))
                     .POST(HttpRequest.BodyPublishers.ofString(payload, StandardCharsets.UTF_8))
                     .build();
-            HttpResponse<Void> response = HttpClient.newHttpClient().send(request, HttpResponse.BodyHandlers.discarding());
+            HttpClient httpClient = HttpClient.newBuilder()
+                    .connectTimeout(Duration.ofMillis(webhook.resolveConnectTimeoutMs()))
+                    .build();
+            HttpResponse<Void> response = httpClient.send(request, HttpResponse.BodyHandlers.discarding());
             int status = response.statusCode();
             if (status >= 200 && status < 300) {
                 return WebhookDeliveryResult.success(status);
@@ -55,15 +55,13 @@ public class DefaultWebhookDeliveryClient implements WebhookDeliveryClient {
             Thread.currentThread().interrupt();
             return WebhookDeliveryResult.retryable("webhook interrupted");
         } catch (Exception exception) {
-            return WebhookDeliveryResult.retryable(exception.getClass().getSimpleName() + ": " + exception.getMessage());
+            return WebhookDeliveryResult.retryable(
+                    "webhook request failed: " + exception.getClass().getSimpleName());
         }
     }
 
-    private long resolveTimeoutMillis() {
-        return timeoutMillis > 0 ? timeoutMillis : 3000;
-    }
-
     private String signature(String payload) {
+        String webhookSecret = notificationProperties.getWebhook().getSecret();
         if (webhookSecret == null || webhookSecret.isBlank()) {
             return "";
         }
@@ -72,7 +70,8 @@ public class DefaultWebhookDeliveryClient implements WebhookDeliveryClient {
             mac.init(new SecretKeySpec(webhookSecret.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
             return "sha256=" + HexFormat.of().formatHex(mac.doFinal(payload.getBytes(StandardCharsets.UTF_8)));
         } catch (Exception exception) {
-            log.warn("webhook signature failed, event omitted, error={}", exception.toString());
+            log.warn("webhook signature failed, event omitted, errorType={}",
+                    exception.getClass().getSimpleName());
             return "";
         }
     }

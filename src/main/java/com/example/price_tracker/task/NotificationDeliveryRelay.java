@@ -1,5 +1,6 @@
 package com.example.price_tracker.task;
 
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.entity.NotificationDelivery;
 import com.example.price_tracker.entity.NotificationDeliveryStatus;
 import com.example.price_tracker.mapper.NotificationDeliveryMapper;
@@ -8,7 +9,6 @@ import com.example.price_tracker.notification.WebhookDeliveryClient;
 import com.example.price_tracker.notification.WebhookDeliveryResult;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -28,40 +28,20 @@ public class NotificationDeliveryRelay {
     private final NotificationDeliveryMapper notificationDeliveryMapper;
     private final WebhookDeliveryClient webhookDeliveryClient;
     private final PriceTrackerMetrics metrics;
-
-    @Value("${notification.delivery.enabled:true}")
-    private boolean relayEnabled = true;
-
-    @Value("${notification.webhook.enabled:false}")
-    private boolean webhookEnabled = false;
-
-    @Value("${notification.delivery.batch-size:20}")
-    private int batchSize = 20;
-
-    @Value("${notification.delivery.max-attempts:3}")
-    private int maxAttempts = 3;
-
-    @Value("${notification.delivery.initial-backoff-seconds:5}")
-    private long initialBackoffSeconds = 5;
-
-    @Value("${notification.delivery.max-backoff-seconds:300}")
-    private long maxBackoffSeconds = 300;
-
-    @Value("${notification.delivery.claim-lease-seconds:120}")
-    private long claimLeaseSeconds = 120;
+    private final NotificationProperties notificationProperties;
 
     private String relayInstanceId = "notification-delivery-relay-" + UUID.randomUUID();
 
-    @Scheduled(fixedDelayString = "${notification.delivery.fixed-delay-ms:5000}")
+    @Scheduled(fixedDelayString = "#{@notificationProperties.delivery.fixedDelayMs}")
     public void relayScheduledDeliveries() {
-        if (!relayEnabled || !webhookEnabled) {
+        if (!deliveryProperties().isEnabled() || !webhookProperties().isEnabled()) {
             return;
         }
         relayPendingDeliveries();
     }
 
     public void relayPendingDeliveries() {
-        if (!relayEnabled || !webhookEnabled) {
+        if (!deliveryProperties().isEnabled() || !webhookProperties().isEnabled()) {
             return;
         }
         LocalDateTime now = LocalDateTime.now();
@@ -109,7 +89,7 @@ public class NotificationDeliveryRelay {
 
     private void markFailure(NotificationDelivery delivery, String error, boolean retryable) {
         int nextAttempts = normalizeAttempts(delivery) + 1;
-        if (!retryable || nextAttempts >= maxAttempts) {
+        if (!retryable || nextAttempts >= deliveryProperties().getMaxAttempts()) {
             int updated = notificationDeliveryMapper.markDead(
                     delivery.getId(), relayInstanceId, nextAttempts, truncate(error), LocalDateTime.now());
             if (updated == 0) {
@@ -140,10 +120,12 @@ public class NotificationDeliveryRelay {
     }
 
     private int resolveBatchSize() {
+        int batchSize = deliveryProperties().getBatchSize();
         return batchSize > 0 ? batchSize : 20;
     }
 
     private long resolveClaimLeaseSeconds() {
+        long claimLeaseSeconds = deliveryProperties().getClaimLeaseSeconds();
         return claimLeaseSeconds > 0 ? claimLeaseSeconds : 120;
     }
 
@@ -153,8 +135,16 @@ public class NotificationDeliveryRelay {
 
     private long backoffSeconds(int attempts) {
         long multiplier = 1L << Math.max(0, attempts - 1);
-        long backoff = initialBackoffSeconds * multiplier;
-        return Math.min(backoff, maxBackoffSeconds);
+        long backoff = deliveryProperties().getInitialBackoffSeconds() * multiplier;
+        return Math.min(backoff, deliveryProperties().getMaxBackoffSeconds());
+    }
+
+    private NotificationProperties.Webhook webhookProperties() {
+        return notificationProperties.getWebhook();
+    }
+
+    private NotificationProperties.Delivery deliveryProperties() {
+        return notificationProperties.getDelivery();
     }
 
     private String truncate(String error) {

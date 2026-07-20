@@ -24,6 +24,10 @@ management:
     rabbit:
       enabled: false
 
+notification:
+  webhook:
+    allow-http: true
+
 outbox:
   relay:
     enabled: false

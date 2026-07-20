@@ -3,6 +3,7 @@ package com.example.price_tracker.service.impl;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.example.price_tracker.common.PageResult;
 import com.example.price_tracker.common.ResultCode;
+import com.example.price_tracker.config.NotificationProperties;
 import com.example.price_tracker.context.UserContext;
 import com.example.price_tracker.dto.NotificationQueryDto;
 import com.example.price_tracker.entity.Notification;
@@ -25,7 +26,6 @@ import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.dao.DuplicateKeyException;
-import org.springframework.test.util.ReflectionTestUtils;
 
 import java.math.BigDecimal;
 
@@ -55,12 +55,16 @@ class NotificationServiceImplTest {
     @Spy
     private ObjectMapper objectMapper = new ObjectMapper().findAndRegisterModules();
 
+    @Spy
+    private NotificationProperties notificationProperties = new NotificationProperties();
+
     @InjectMocks
     private NotificationServiceImpl notificationService;
 
     @BeforeEach
     void setUp() {
         UserContext.setCurrentUserId(99L);
+        notificationProperties.getWebhook().setEnabled(false);
     }
 
     @AfterEach
@@ -106,7 +110,7 @@ class NotificationServiceImplTest {
 
     @Test
     void consumePriceAlertCreatesWebhookDeliveryWhenWebhookEnabled() {
-        ReflectionTestUtils.setField(notificationService, "webhookEnabled", true);
+        notificationProperties.getWebhook().setEnabled(true);
         when(notificationMapper.selectByEventKey(eventKey())).thenReturn(null);
         when(watchlistMapper.selectById(5L)).thenReturn(activeWatchlistWithoutDedupPrice());
 

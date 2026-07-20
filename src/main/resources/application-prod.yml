@@ -44,6 +44,4 @@ price-provider:
 
 notification:
   webhook:
-    enabled: ${WEBHOOK_ENABLED:false}
-    url: ${WEBHOOK_URL:}
-    secret: ${WEBHOOK_SECRET:}
+    allow-http: false

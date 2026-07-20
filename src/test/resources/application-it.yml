@@ -12,3 +12,7 @@ spring:
 outbox:
   relay:
     enabled: false
+
+notification:
+  webhook:
+    allow-http: true
