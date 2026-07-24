@@ -4,6 +4,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -12,6 +13,7 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @SpringBootTest
 @Testcontainers
@@ -60,6 +62,23 @@ class MySQLFlywayIT {
         assertThat(indexExists("tb_outbox_event", "idx_outbox_event_status_retry_id")).isTrue();
         assertThat(indexExists("tb_outbox_event", "idx_outbox_event_claim_ready")).isTrue();
         assertThat(indexExists("tb_notification_delivery", "idx_notification_delivery_claim_ready")).isTrue();
+    }
+
+    @Test
+    void outboxEventKeyUniqueConstraintRejectsDuplicateRows() {
+        jdbcTemplate.execute("DELETE FROM tb_outbox_event");
+        String sql = """
+                INSERT INTO tb_outbox_event
+                    (event_key, event_type, payload, status, attempts, next_retry_at, created_at, updated_at)
+                VALUES (?, 'PRICE_ALERT_TARGET_REACHED_V1', JSON_OBJECT(), 'PENDING', 0, NOW(), NOW(), NOW())
+                """;
+        assertThat(jdbcTemplate.update(sql, "duplicate-event-key")).isEqualTo(1);
+
+        assertThatThrownBy(() -> jdbcTemplate.update(sql, "duplicate-event-key"))
+                .isInstanceOf(DuplicateKeyException.class);
+        assertThat(jdbcTemplate.queryForObject(
+                "SELECT COUNT(*) FROM tb_outbox_event WHERE event_key = 'duplicate-event-key'",
+                Integer.class)).isEqualTo(1);
     }
 
     private boolean tableExists(String tableName) {

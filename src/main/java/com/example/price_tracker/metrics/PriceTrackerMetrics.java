@@ -18,6 +18,7 @@ public class PriceTrackerMetrics {
     public static final String METRIC_PRICE_PROVIDER_FAILURE = "price_provider_failure_total";
     public static final String METRIC_OUTBOX_RELAY = "outbox_relay_total";
     public static final String METRIC_NOTIFICATION_DELIVERY = "notification_delivery_total";
+    public static final String METRIC_PRODUCT_CACHE_EVICTION = "product_cache_eviction_total";
 
     // Tag keys
     public static final String TAG_RESULT = "result";
@@ -89,6 +90,12 @@ public class PriceTrackerMetrics {
     public void recordPriceProviderFailure(String provider, String failureType) {
         if (registry != null) {
             registry.counter(METRIC_PRICE_PROVIDER_FAILURE, TAG_PROVIDER, provider, TAG_FAILURE_TYPE, failureType).increment();
+        }
+    }
+
+    public void recordProductCacheEviction(String result) {
+        if (registry != null) {
+            registry.counter(METRIC_PRODUCT_CACHE_EVICTION, TAG_RESULT, result).increment();
         }
     }
 }

@@ -2,46 +2,47 @@ package com.example.price_tracker.service.impl;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.example.price_tracker.common.ResultCode;
 import com.example.price_tracker.entity.OutboxEvent;
 import com.example.price_tracker.entity.OutboxEventStatus;
-import com.example.price_tracker.common.ResultCode;
 import com.example.price_tracker.entity.PriceHistory;
 import com.example.price_tracker.entity.Product;
 import com.example.price_tracker.entity.Watchlist;
-import com.example.price_tracker.mapper.OutboxEventMapper;
 import com.example.price_tracker.exception.BusinessException;
+import com.example.price_tracker.exception.PriceRefreshConflictException;
+import com.example.price_tracker.exception.ProductRefreshUnavailableException;
+import com.example.price_tracker.mapper.OutboxEventMapper;
 import com.example.price_tracker.mapper.PriceHistoryMapper;
 import com.example.price_tracker.mapper.ProductMapper;
 import com.example.price_tracker.mapper.WatchlistMapper;
+import com.example.price_tracker.metrics.PriceTrackerMetrics;
 import com.example.price_tracker.mq.message.PriceAlertEventKeyBuilder;
 import com.example.price_tracker.mq.message.PriceAlertMessage;
 import com.example.price_tracker.provider.PriceProvider;
 import com.example.price_tracker.provider.PriceProviderException;
 import com.example.price_tracker.provider.PriceProviderRouter;
 import com.example.price_tracker.provider.PriceQuote;
+import com.example.price_tracker.redis.ProductCacheEvictionCoordinator;
 import com.example.price_tracker.redis.RedisCacheService;
-import com.example.price_tracker.metrics.PriceTrackerMetrics;
 import com.example.price_tracker.redis.RedisKeyManager;
 import com.example.price_tracker.service.PriceService;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionDefinition;
-import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
-
 
 import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Objects;
 
 @Service
 @Slf4j
@@ -60,6 +61,7 @@ public class PriceServiceImpl implements PriceService {
     private final OutboxEventMapper outboxEventMapper;
     private final PriceProviderRouter priceProviderRouter;
     private final RedisCacheService cacheService;
+    private final ProductCacheEvictionCoordinator productCacheEvictionCoordinator;
     private final PriceTrackerMetrics metrics;
     private final ObjectMapper objectMapper;
     private final TransactionTemplate transactionTemplate;
@@ -71,6 +73,7 @@ public class PriceServiceImpl implements PriceService {
                             OutboxEventMapper outboxEventMapper,
                             PriceProviderRouter priceProviderRouter,
                             RedisCacheService cacheService,
+                            ProductCacheEvictionCoordinator productCacheEvictionCoordinator,
                             PriceTrackerMetrics metrics,
                             ObjectMapper objectMapper,
                             PlatformTransactionManager transactionManager) {
@@ -80,6 +83,7 @@ public class PriceServiceImpl implements PriceService {
         this.outboxEventMapper = outboxEventMapper;
         this.priceProviderRouter = priceProviderRouter;
         this.cacheService = cacheService;
+        this.productCacheEvictionCoordinator = productCacheEvictionCoordinator;
         this.metrics = metrics;
         this.objectMapper = objectMapper;
         this.transactionTemplate = new TransactionTemplate(transactionManager);
@@ -93,17 +97,20 @@ public class PriceServiceImpl implements PriceService {
     private int priceRefreshBatchSize = DEFAULT_BATCH_SIZE;
 
     @Override
-    @Transactional
     public void refreshProductPrice(Long productId) {
         lastResolvedProvider.remove();
         try {
-            refreshProductPriceInternal(productId);
-            String providerCode = lastResolvedProvider.get();
-            metrics.recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_SUCCESS, providerCode != null ? providerCode : "unknown");
-        } catch (RuntimeException exception) {
-            String providerCode = lastResolvedProvider.get();
-            metrics.recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, providerCode != null ? providerCode : "unknown");
-            throw exception;
+            try {
+                executeRefreshAttempt(productId);
+            } catch (RuntimeException exception) {
+                safelyRecordPriceRefreshFinal(
+                        PriceTrackerMetrics.RESULT_FAILED,
+                        resolvedProviderCode());
+                throw exception;
+            }
+            safelyRecordPriceRefreshFinal(
+                    PriceTrackerMetrics.RESULT_SUCCESS,
+                    resolvedProviderCode());
         } finally {
             lastResolvedProvider.remove();
         }
@@ -111,73 +118,126 @@ public class PriceServiceImpl implements PriceService {
 
     private int refreshProductPriceInternal(Long productId) {
         Product product = getActiveProductOrThrow(productId);
-        BigDecimal oldPrice = product.getCurrentPrice() == null ? DEFAULT_PRICE : product.getCurrentPrice();
+        BigDecimal expectedOldPrice = product.getCurrentPrice();
+        BigDecimal oldPrice = expectedOldPrice == null ? DEFAULT_PRICE : expectedOldPrice;
         PriceProvider priceProvider = null;
+        PriceQuote quote;
         long startNanos = System.nanoTime();
         try {
             priceProvider = priceProviderRouter.route(product);
             lastResolvedProvider.set(priceProvider.providerCode());
-            PriceQuote quote = priceProvider.fetchPrice(product);
-            long durationNanos = System.nanoTime() - startNanos;
-            metrics.recordPriceProviderFetch(priceProvider.providerCode(), PriceTrackerMetrics.RESULT_SUCCESS, Duration.ofNanos(durationNanos));
-
-            BigDecimal newPrice = quote.price();
-            LocalDateTime capturedAt = quote.capturedAt();
-            product.setCurrency(quote.currency());
-            product.setLastCheckedAt(capturedAt);
-            if (newPrice.compareTo(oldPrice) == 0) {
-                productMapper.updateById(product);
-                clearProductCache(productId);
-                metrics.recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_SUCCESS, priceProvider.providerCode());
-                return 0;
-            }
-            product.setCurrentPrice(newPrice);
-            product.setUpdatedAt(capturedAt);
-            productMapper.updateById(product);
-            clearProductCache(productId);
-            priceHistoryMapper.insert(PriceHistory.builder()
-                    .productId(product.getId())
-                    .oldPrice(oldPrice)
-                    .newPrice(newPrice)
-                    .capturedAt(capturedAt)
-                    .source(quote.source())
-                    .build());
-            int notificationTriggeredCount = 0;
-            List<Watchlist> watchlists = watchlistMapper.selectList(new LambdaQueryWrapper<Watchlist>()
-                    .eq(Watchlist::getProductId, productId)
-                    .eq(Watchlist::getStatus, ACTIVE_STATUS)
-                    .eq(Watchlist::getNotifyEnabled, NOTIFY_ENABLED));
-            for (Watchlist watchlist : watchlists) {
-                if (shouldNotify(watchlist, newPrice)) {
-                    if (sendAlertIfNotDuplicate(product, watchlist, newPrice, capturedAt)) {
-                        notificationTriggeredCount++;
-                    }
-                }
-            }
-            metrics.recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_SUCCESS, priceProvider.providerCode());
-            return notificationTriggeredCount;
+            quote = priceProvider.fetchPrice(product);
         } catch (PriceProviderException exception) {
             long durationNanos = System.nanoTime() - startNanos;
-            String providerCode = (priceProvider != null) ? priceProvider.providerCode() : "unknown";
+            String providerCode = priceProvider != null ? priceProvider.providerCode() : "unknown";
             if (priceProvider != null) {
                 lastResolvedProvider.set(providerCode);
-                metrics.recordPriceProviderFetch(providerCode, PriceTrackerMetrics.RESULT_FAILED, Duration.ofNanos(durationNanos));
-                metrics.recordPriceProviderFailure(providerCode, exception.getFailureType().name());
+                safelyRecordPriceProviderFetch(
+                        providerCode,
+                        PriceTrackerMetrics.RESULT_FAILED,
+                        Duration.ofNanos(durationNanos));
+                safelyRecordPriceProviderFailure(
+                        providerCode,
+                        exception.getFailureType().name());
             }
-            metrics.recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, providerCode);
             log.warn("price provider fetch failed, productId={}, providerCode={}, failureType={}, retryable={}, error={}",
                     productId, providerCode, exception.getFailureType(), exception.isRetryable(), exception.getMessage());
             throw exception;
         } catch (RuntimeException exception) {
-            long durationNanos = System.nanoTime() - startNanos;
-            String providerCode = (priceProvider != null) ? priceProvider.providerCode() : "unknown";
             if (priceProvider != null) {
+                long durationNanos = System.nanoTime() - startNanos;
+                String providerCode = priceProvider.providerCode();
                 lastResolvedProvider.set(providerCode);
-                metrics.recordPriceProviderFetch(providerCode, PriceTrackerMetrics.RESULT_FAILED, Duration.ofNanos(durationNanos));
+                safelyRecordPriceProviderFetch(
+                        providerCode,
+                        PriceTrackerMetrics.RESULT_FAILED,
+                        Duration.ofNanos(durationNanos));
             }
-            metrics.recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, providerCode);
             throw exception;
         }
+
+        safelyRecordPriceProviderFetch(
+                priceProvider.providerCode(),
+                PriceTrackerMetrics.RESULT_SUCCESS,
+                Duration.ofNanos(System.nanoTime() - startNanos));
+
+        BigDecimal newPrice = quote.price();
+        LocalDateTime capturedAt = quote.capturedAt();
+        boolean priceUnchanged = expectedOldPrice != null
+                && newPrice.compareTo(expectedOldPrice) == 0;
+        if (priceUnchanged) {
+            int affectedRows = productMapper.updateRefreshMetadataIfPriceMatches(
+                    productId,
+                    ACTIVE_STATUS,
+                    expectedOldPrice,
+                    quote.currency(),
+                    capturedAt);
+            if (affectedRows == 0 && isLegalMetadataNoOp(
+                    productId, expectedOldPrice, quote.currency(), capturedAt)) {
+                return 0;
+            }
+            requireSingleProductUpdate(affectedRows, productId, expectedOldPrice);
+            productCacheEvictionCoordinator.registerProductCacheEvictionAfterCommit(productId);
+            return 0;
+        }
+
+        int affectedRows = productMapper.updateRefreshPriceIfPriceMatches(
+                productId,
+                ACTIVE_STATUS,
+                expectedOldPrice,
+                newPrice,
+                quote.currency(),
+                capturedAt,
+                capturedAt);
+        requireSingleProductUpdate(affectedRows, productId, expectedOldPrice);
+        productCacheEvictionCoordinator.registerProductCacheEvictionAfterCommit(productId);
+        product.setCurrentPrice(newPrice);
+        product.setCurrency(quote.currency());
+        product.setLastCheckedAt(capturedAt);
+        product.setUpdatedAt(capturedAt);
+        int historyInserted = priceHistoryMapper.insert(PriceHistory.builder()
+                .productId(product.getId())
+                .oldPrice(oldPrice)
+                .newPrice(newPrice)
+                .capturedAt(capturedAt)
+                .source(quote.source())
+                .build());
+        if (historyInserted != 1) {
+            throw new BusinessException(
+                    ResultCode.SYSTEM_ERROR,
+                    "price history insert affected unexpected rows, productId=" + productId
+                            + ", affectedRows=" + historyInserted);
+        }
+        int notificationTriggeredCount = 0;
+        List<Watchlist> watchlists = watchlistMapper.selectList(new LambdaQueryWrapper<Watchlist>()
+                .eq(Watchlist::getProductId, productId)
+                .eq(Watchlist::getStatus, ACTIVE_STATUS)
+                .eq(Watchlist::getNotifyEnabled, NOTIFY_ENABLED));
+        for (Watchlist watchlist : watchlists) {
+            if (shouldNotify(watchlist, newPrice)) {
+                if (sendAlertIfNotDuplicate(product, watchlist, newPrice, capturedAt)) {
+                    notificationTriggeredCount++;
+                }
+            }
+        }
+        return notificationTriggeredCount;
+    }
+
+    private int executeRefreshAttempt(Long productId) {
+        Integer notificationCount;
+        try {
+            notificationCount = transactionTemplate.execute(
+                    status -> refreshProductPriceInternal(productId));
+        } catch (RuntimeException exception) {
+            safelyRecordPriceRefreshAttempt(
+                    PriceTrackerMetrics.RESULT_FAILED,
+                    resolvedProviderCode());
+            throw exception;
+        }
+        safelyRecordPriceRefreshAttempt(
+                PriceTrackerMetrics.RESULT_SUCCESS,
+                resolvedProviderCode());
+        return notificationCount != null ? notificationCount : 0;
     }
 
     @Override
@@ -228,33 +288,120 @@ public class PriceServiceImpl implements PriceService {
     private int refreshProductWithRetry(Long productId) {
         RuntimeException lastException = null;
         lastResolvedProvider.remove();
-        for (int attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
-            try {
-                Integer notificationCount = transactionTemplate.execute(status -> refreshProductPriceInternal(productId));
-                String providerCode = lastResolvedProvider.get();
-                metrics.recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_SUCCESS, providerCode != null ? providerCode : "unknown");
-                lastResolvedProvider.remove();
-                return notificationCount != null ? notificationCount : 0;
-            } catch (PriceProviderException exception) {
-                lastException = exception;
-                String providerCode = lastResolvedProvider.get();
-                log.warn("price refresh attempt failed due to provider error, productId={}, attempt={}, maxRetries={}, failureType={}, retryable={}, message={}",
-                        productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getFailureType(), exception.isRetryable(), exception.getMessage());
-                if (!exception.isRetryable()) {
-                    metrics.recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, providerCode != null ? providerCode : "unknown");
-                    lastResolvedProvider.remove();
+        try {
+            for (int attempt = 0; attempt <= MAX_REFRESH_RETRIES; attempt++) {
+                try {
+                    int notificationCount = executeRefreshAttempt(productId);
+                    safelyRecordPriceRefreshFinal(
+                            PriceTrackerMetrics.RESULT_SUCCESS,
+                            resolvedProviderCode());
+                    return notificationCount;
+                } catch (ProductRefreshUnavailableException exception) {
+                    log.warn("price refresh stopped because product is unavailable, productId={}, attempt={}, message={}",
+                            productId, attempt + 1, exception.getMessage());
+                    safelyRecordPriceRefreshFinal(
+                            PriceTrackerMetrics.RESULT_FAILED,
+                            resolvedProviderCode());
                     throw exception;
+                } catch (PriceRefreshConflictException exception) {
+                    lastException = exception;
+                    boolean willRetry = attempt < MAX_REFRESH_RETRIES;
+                    if (willRetry) {
+                        log.warn("price refresh retrying after concurrent price change, productId={}, attempt={}, maxRetries={}, message={}",
+                                productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getMessage());
+                    } else {
+                        log.warn("price refresh retries exhausted after concurrent price change, productId={}, attempt={}, maxRetries={}, message={}",
+                                productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getMessage());
+                    }
+                } catch (PriceProviderException exception) {
+                    lastException = exception;
+                    log.warn("price refresh attempt failed due to provider error, productId={}, attempt={}, maxRetries={}, failureType={}, retryable={}, message={}",
+                            productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getFailureType(), exception.isRetryable(), exception.getMessage());
+                    if (!exception.isRetryable()) {
+                        safelyRecordPriceRefreshFinal(
+                                PriceTrackerMetrics.RESULT_FAILED,
+                                resolvedProviderCode());
+                        throw exception;
+                    }
+                } catch (RuntimeException exception) {
+                    lastException = exception;
+                    log.warn("price refresh attempt failed, productId={}, attempt={}, maxRetries={}, message={}",
+                            productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getMessage());
                 }
-            } catch (RuntimeException exception) {
-                lastException = exception;
-                log.warn("price refresh attempt failed, productId={}, attempt={}, maxRetries={}, message={}",
-                        productId, attempt + 1, MAX_REFRESH_RETRIES, exception.getMessage());
             }
+            safelyRecordPriceRefreshFinal(
+                    PriceTrackerMetrics.RESULT_FAILED,
+                    resolvedProviderCode());
+            throw lastException;
+        } finally {
+            lastResolvedProvider.remove();
         }
+    }
+
+    private String resolvedProviderCode() {
         String providerCode = lastResolvedProvider.get();
-        metrics.recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, providerCode != null ? providerCode : "unknown");
-        lastResolvedProvider.remove();
-        throw lastException;
+        return providerCode != null ? providerCode : "unknown";
+    }
+
+    private void safelyRecordPriceRefreshFinal(String result, String providerCode) {
+        safelyRecordMetric(
+                "price refresh final",
+                result,
+                providerCode,
+                () -> metrics.recordPriceRefreshFinal(result, providerCode));
+    }
+
+    private void safelyRecordPriceRefreshAttempt(String result, String providerCode) {
+        safelyRecordMetric(
+                "price refresh attempt",
+                result,
+                providerCode,
+                () -> metrics.recordPriceRefreshAttempt(result, providerCode));
+    }
+
+    private void safelyRecordPriceProviderFetch(String providerCode,
+                                                String result,
+                                                Duration duration) {
+        safelyRecordMetric(
+                "price provider fetch",
+                result,
+                providerCode,
+                () -> metrics.recordPriceProviderFetch(providerCode, result, duration));
+    }
+
+    private void safelyRecordPriceProviderFailure(String providerCode, String failureType) {
+        safelyRecordMetric(
+                "price provider failure",
+                failureType,
+                providerCode,
+                () -> metrics.recordPriceProviderFailure(providerCode, failureType));
+    }
+
+    private void safelyRecordMetric(String metricName,
+                                    String result,
+                                    String providerCode,
+                                    Runnable action) {
+        try {
+            action.run();
+        } catch (RuntimeException exception) {
+            safelyLogMetricFailure(metricName, result, providerCode, exception);
+        }
+    }
+
+    private void safelyLogMetricFailure(String metricName,
+                                        String result,
+                                        String providerCode,
+                                        RuntimeException metricException) {
+        try {
+            log.warn(
+                    "failed to record metric, metricName={}, result={}, providerCode={}",
+                    metricName,
+                    result,
+                    providerCode,
+                    metricException);
+        } catch (RuntimeException ignored) {
+            // Observability failures must not affect price refresh business control flow.
+        }
     }
 
     private int resolveBatchSize() {
@@ -325,10 +472,12 @@ public class PriceServiceImpl implements PriceService {
                 .updatedAt(now)
                 .build();
         try {
-            int inserted = outboxEventMapper.insertIgnore(event);
-            if (inserted == 0) {
-                log.info("outbox event already exists, eventKey={}, decision=idempotent_skip", message.getEventKey());
-                return false;
+            int inserted = outboxEventMapper.insertEvent(event);
+            if (inserted != 1) {
+                throw new BusinessException(
+                        ResultCode.SYSTEM_ERROR,
+                        "outbox event insert affected unexpected rows, eventKey=" + message.getEventKey()
+                                + ", affectedRows=" + inserted);
             }
             log.info("created outbox event for price alert, eventKey={}, productId={}, userId={}, watchlistId={}",
                     message.getEventKey(), message.getProductId(), message.getUserId(), message.getWatchlistId());
@@ -343,22 +492,65 @@ public class PriceServiceImpl implements PriceService {
         try {
             return objectMapper.writeValueAsString(message);
         } catch (JsonProcessingException exception) {
-            throw new BusinessException(ResultCode.SYSTEM_ERROR, "failed to serialize price alert outbox payload");
+            throw new BusinessException(
+                    ResultCode.SYSTEM_ERROR,
+                    "failed to serialize price alert outbox payload",
+                    exception);
         }
     }
 
     private Product getActiveProductOrThrow(Long productId) {
         Product product = productMapper.selectById(productId);
         if (product == null || product.getStatus() == null || product.getStatus() != ACTIVE_STATUS) {
-            throw new BusinessException(ResultCode.NOT_FOUND, "product not found");
+            throw new ProductRefreshUnavailableException(productId);
         }
         return product;
     }
 
-    private void clearProductCache(Long productId) {
-        cacheService.delete(RedisKeyManager.productDetailKey(productId));
-        cacheService.delete(RedisKeyManager.productPriceKey(productId));
-        cacheService.delete(RedisKeyManager.nullValueKey("product:detail:" + productId));
-        cacheService.delete(RedisKeyManager.nullValueKey("product:price:" + productId));
+    private boolean isLegalMetadataNoOp(Long productId,
+                                        BigDecimal expectedOldPrice,
+                                        String currency,
+                                        LocalDateTime lastCheckedAt) {
+        Product currentState = selectCurrentRefreshStateOrThrow(productId, expectedOldPrice);
+        return Objects.equals(currentState.getCurrency(), currency)
+                && Objects.equals(currentState.getLastCheckedAt(), lastCheckedAt);
+    }
+
+    private void requireSingleProductUpdate(int affectedRows,
+                                            Long productId,
+                                            BigDecimal expectedOldPrice) {
+        if (affectedRows == 1) {
+            return;
+        }
+        if (affectedRows == 0) {
+            selectCurrentRefreshStateOrThrow(productId, expectedOldPrice);
+        }
+        throw new BusinessException(
+                ResultCode.SYSTEM_ERROR,
+                "product refresh update affected unexpected rows, productId=" + productId
+                        + ", affectedRows=" + affectedRows);
+    }
+
+    private Product selectCurrentRefreshStateOrThrow(Long productId, BigDecimal expectedOldPrice) {
+        Product currentState = productMapper.selectRefreshStateForUpdate(productId);
+        if (currentState == null
+                || currentState.getStatus() == null
+                || currentState.getStatus() != ACTIVE_STATUS) {
+            throw new ProductRefreshUnavailableException(productId);
+        }
+        if (!pricesEqual(currentState.getCurrentPrice(), expectedOldPrice)) {
+            throw new PriceRefreshConflictException(
+                    productId,
+                    expectedOldPrice,
+                    currentState.getCurrentPrice());
+        }
+        return currentState;
+    }
+
+    private boolean pricesEqual(BigDecimal left, BigDecimal right) {
+        if (left == null || right == null) {
+            return left == right;
+        }
+        return left.compareTo(right) == 0;
     }
 }

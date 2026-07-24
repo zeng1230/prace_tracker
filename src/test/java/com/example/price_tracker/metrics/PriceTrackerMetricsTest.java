@@ -99,4 +99,16 @@ class PriceTrackerMetricsTest {
         assertNotNull(counter);
         assertEquals(1.0, counter.count());
     }
+
+    @Test
+    void recordProductCacheEvictionIncrementsCounter() {
+        metrics.recordProductCacheEviction(PriceTrackerMetrics.RESULT_FAILED);
+
+        Counter counter = registry.find(PriceTrackerMetrics.METRIC_PRODUCT_CACHE_EVICTION)
+                .tag(PriceTrackerMetrics.TAG_RESULT, PriceTrackerMetrics.RESULT_FAILED)
+                .counter();
+
+        assertNotNull(counter);
+        assertEquals(1.0, counter.count());
+    }
 }

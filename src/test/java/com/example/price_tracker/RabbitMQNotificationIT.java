@@ -261,7 +261,7 @@ public class RabbitMQNotificationIT {
                 .createdAt(LocalDateTime.now())
                 .updatedAt(LocalDateTime.now())
                 .build();
-        assertThat(outboxEventMapper.insertIgnore(outboxEvent)).isEqualTo(1);
+        assertThat(outboxEventMapper.insertEvent(outboxEvent)).isEqualTo(1);
 
         outboxRelay.relayPendingEvents();
 
@@ -380,10 +380,10 @@ public class RabbitMQNotificationIT {
         jdbcTemplate.execute("DELETE FROM tb_outbox_event");
         jdbcTemplate.execute("DELETE FROM tb_price_history");
 
-        // 2. Stub outboxEventMapper.insertIgnore to throw RuntimeException
+        // 2. Stub outboxEventMapper.insertEvent to throw RuntimeException
         doThrow(new RuntimeException("Simulated Database Error"))
                 .when(outboxEventMapper)
-                .insertIgnore(any());
+                .insertEvent(any());
 
         // 3. Trigger price refresh
         try {

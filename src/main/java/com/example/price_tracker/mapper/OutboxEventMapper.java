@@ -17,14 +17,14 @@ import java.util.List;
 public interface OutboxEventMapper extends BaseMapper<OutboxEvent> {
 
     @Insert("""
-            INSERT IGNORE INTO tb_outbox_event
+            INSERT INTO tb_outbox_event
                 (event_key, event_type, payload, status, attempts, next_retry_at, last_error, created_at, updated_at)
             VALUES
                 (#{event.eventKey}, #{event.eventType}, #{event.payload}, #{event.status},
                  #{event.attempts}, #{event.nextRetryAt}, #{event.lastError}, #{event.createdAt}, #{event.updatedAt})
             """)
     @Options(useGeneratedKeys = true, keyProperty = "event.id")
-    int insertIgnore(@Param("event") OutboxEvent event);
+    int insertEvent(@Param("event") OutboxEvent event);
 
     @Select("""
             <script>

@@ -120,7 +120,7 @@ class RelayClaimOwnershipIT {
                 .createdAt(nextRetryAt)
                 .updatedAt(nextRetryAt)
                 .build();
-        assertThat(outboxEventMapper.insertIgnore(event)).isEqualTo(1);
+        assertThat(outboxEventMapper.insertEvent(event)).isEqualTo(1);
         return event;
     }
 

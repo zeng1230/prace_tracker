@@ -6,6 +6,9 @@ import com.example.price_tracker.entity.OutboxEventStatus;
 import com.example.price_tracker.entity.PriceHistory;
 import com.example.price_tracker.entity.Product;
 import com.example.price_tracker.entity.Watchlist;
+import com.example.price_tracker.exception.BusinessException;
+import com.example.price_tracker.exception.PriceRefreshConflictException;
+import com.example.price_tracker.exception.ProductRefreshUnavailableException;
 import com.example.price_tracker.mapper.OutboxEventMapper;
 import com.example.price_tracker.mapper.PriceHistoryMapper;
 import com.example.price_tracker.mapper.ProductMapper;
@@ -20,16 +23,21 @@ import com.example.price_tracker.provider.PriceQuote;
 import com.example.price_tracker.metrics.PriceTrackerMetrics;
 import com.example.price_tracker.redis.RedisCacheService;
 import com.example.price_tracker.redis.RedisKeyManager;
+import com.example.price_tracker.redis.ProductCacheEvictionCoordinator;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.ArgumentMatcher;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.mockito.Mock;
 import org.mockito.Spy;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.test.util.ReflectionTestUtils;
+import org.springframework.dao.DataAccessResourceFailureException;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
 
@@ -42,12 +50,16 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 @ExtendWith(MockitoExtension.class)
 class PriceServiceImplTest {
@@ -79,6 +91,9 @@ class PriceServiceImplTest {
     private RedisCacheService cacheService;
 
     @Mock
+    private ProductCacheEvictionCoordinator productCacheEvictionCoordinator;
+
+    @Mock
     private PriceTrackerMetrics metrics;
 
     @Spy
@@ -93,6 +108,11 @@ class PriceServiceImplTest {
     void setUp() {
         TransactionStatus mockStatus = mock(TransactionStatus.class);
         lenient().when(transactionManager.getTransaction(any())).thenReturn(mockStatus);
+        lenient().when(productMapper.updateRefreshMetadataIfPriceMatches(
+                any(), any(), any(), any(), any())).thenReturn(1);
+        lenient().when(productMapper.updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(1);
+        lenient().when(priceHistoryMapper.insert(any(PriceHistory.class))).thenReturn(1);
 
         priceService = new PriceServiceImpl(
                 productMapper,
@@ -101,6 +121,7 @@ class PriceServiceImplTest {
                 outboxEventMapper,
                 priceProviderRouter,
                 cacheService,
+                productCacheEvictionCoordinator,
                 metrics,
                 objectMapper,
                 transactionManager
@@ -116,18 +137,19 @@ class PriceServiceImplTest {
                 RedisKeyManager.notificationIdempotentKey("99:1:80.00"),
                 "1",
                 java.time.Duration.ofMinutes(10))).thenReturn(true);
-        when(outboxEventMapper.insertIgnore(any(OutboxEvent.class))).thenReturn(1);
+        when(outboxEventMapper.insertEvent(any(OutboxEvent.class))).thenReturn(1);
 
         priceService.refreshProductPrice(1L);
 
-        verify(productMapper).updateById(argThat(updatedProduct()));
+        verify(productMapper).updateRefreshPriceIfPriceMatches(
+                eq(1L), eq(1), eq(new BigDecimal("100.00")), eq(new BigDecimal("79.00")),
+                eq("CNY"), eq(CAPTURED_AT), eq(CAPTURED_AT));
         verify(priceHistoryMapper).insert(argThat(createdPriceHistory("79.00")));
         verify(priceAlertProducer, never()).send(any(PriceAlertMessage.class));
         ArgumentCaptor<OutboxEvent> outboxCaptor = ArgumentCaptor.forClass(OutboxEvent.class);
-        verify(outboxEventMapper).insertIgnore(outboxCaptor.capture());
+        verify(outboxEventMapper).insertEvent(outboxCaptor.capture());
         assertThat(createdOutboxEvent().matches(outboxCaptor.getValue())).isTrue();
-        verify(cacheService).delete(RedisKeyManager.productDetailKey(1L));
-        verify(cacheService).delete(RedisKeyManager.productPriceKey(1L));
+        verify(productCacheEvictionCoordinator).registerProductCacheEvictionAfterCommit(1L);
     }
 
     @Test
@@ -138,12 +160,12 @@ class PriceServiceImplTest {
 
         priceService.refreshProductPrice(1L);
 
-        verify(productMapper).updateById(argThat((Product product) ->
-                new BigDecimal("81.00").compareTo(product.getCurrentPrice()) == 0));
+        verify(productMapper).updateRefreshPriceIfPriceMatches(
+                eq(1L), eq(1), eq(new BigDecimal("100.00")), eq(new BigDecimal("81.00")),
+                eq("USD"), eq(CAPTURED_AT), eq(CAPTURED_AT));
         verify(priceHistoryMapper).insert(any(PriceHistory.class));
         verify(priceAlertProducer, never()).send(any(PriceAlertMessage.class));
-        verify(cacheService).delete(RedisKeyManager.productDetailKey(1L));
-        verify(cacheService).delete(RedisKeyManager.productPriceKey(1L));
+        verify(productCacheEvictionCoordinator).registerProductCacheEvictionAfterCommit(1L);
     }
 
     @Test
@@ -170,13 +192,14 @@ class PriceServiceImplTest {
                 RedisKeyManager.notificationIdempotentKey("99:1:80.00"),
                 "1",
                 java.time.Duration.ofMinutes(10))).thenReturn(true);
-        when(outboxEventMapper.insertIgnore(any(OutboxEvent.class))).thenReturn(0);
+        when(outboxEventMapper.insertEvent(any(OutboxEvent.class)))
+                .thenThrow(new DuplicateKeyException("duplicate event key"));
 
         priceService.refreshProductPrice(1L);
 
         verify(priceHistoryMapper).insert(any(PriceHistory.class));
         verify(priceAlertProducer, never()).send(any(PriceAlertMessage.class));
-        verify(outboxEventMapper).insertIgnore(any(OutboxEvent.class));
+        verify(outboxEventMapper).insertEvent(any(OutboxEvent.class));
     }
 
     @Test
@@ -203,7 +226,8 @@ class PriceServiceImplTest {
 
         priceService.refreshActiveProducts();
 
-        verify(productMapper, times(3)).updateById(any(Product.class));
+        verify(productMapper, times(3)).updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any());
         verify(productMapper, times(2)).selectPage(any(Page.class), any());
     }
 
@@ -218,7 +242,8 @@ class PriceServiceImplTest {
 
         priceService.refreshActiveProducts();
 
-        verify(productMapper).updateById(argThat((Product product) -> product.getId().equals(2L)));
+        verify(productMapper).updateRefreshPriceIfPriceMatches(
+                eq(2L), any(), any(), any(), any(), any(), any());
     }
 
     @Test
@@ -230,15 +255,9 @@ class PriceServiceImplTest {
         priceService.refreshActiveProducts();
 
         verify(productMapper, times(3)).selectById(1L);
-        verify(productMapper, never()).updateById(any(Product.class));
+        verify(productMapper, never()).updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any());
         verify(productMapper, atLeastOnce()).selectPage(any(Page.class), any());
-    }
-
-    private ArgumentMatcher<Product> updatedProduct() {
-        return product -> new BigDecimal("79.00").compareTo(product.getCurrentPrice()) == 0
-                && "CNY".equals(product.getCurrency())
-                && CAPTURED_AT.equals(product.getLastCheckedAt())
-                && CAPTURED_AT.equals(product.getUpdatedAt());
     }
 
     private ArgumentMatcher<PriceHistory> createdPriceHistory(String expectedPrice) {
@@ -308,6 +327,7 @@ class PriceServiceImplTest {
 
     private void mockQuote(String price, String currency) {
         when(priceProviderRouter.route(any(Product.class))).thenReturn(priceProvider);
+        lenient().when(priceProvider.providerCode()).thenReturn("MOCK");
         when(priceProvider.fetchPrice(any(Product.class))).thenReturn(new PriceQuote(
                 new BigDecimal(price),
                 currency,
@@ -347,5 +367,411 @@ class PriceServiceImplTest {
 
         // Should only query the product once and abort retrying because it's not retryable
         verify(productMapper, times(1)).selectById(1L);
+    }
+
+    @Test
+    void refreshProductPriceTreatsUnchangedAffectedRowsZeroAsLegalNoOp() {
+        Product currentState = activeProduct();
+        currentState.setLastCheckedAt(CAPTURED_AT);
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("100.00", "USD");
+        when(productMapper.updateRefreshMetadataIfPriceMatches(
+                eq(1L), eq(1), eq(new BigDecimal("100.00")), eq("USD"), eq(CAPTURED_AT)))
+                .thenReturn(0);
+        when(productMapper.selectRefreshStateForUpdate(1L)).thenReturn(currentState);
+
+        priceService.refreshProductPrice(1L);
+
+        verify(priceHistoryMapper, never()).insert(any(PriceHistory.class));
+        verify(outboxEventMapper, never()).insertEvent(any());
+        verify(productCacheEvictionCoordinator, never()).registerProductCacheEvictionAfterCommit(any());
+    }
+
+    @Test
+    void refreshProductPriceUsesIsNullGuardForMissingDatabasePrice() {
+        Product productWithoutPrice = activeProduct();
+        productWithoutPrice.setCurrentPrice(null);
+        Watchlist watchlist = activeWatchlistWithoutDedupPrice();
+        watchlist.setTargetPrice(new BigDecimal("100.00"));
+        when(productMapper.selectById(1L)).thenReturn(productWithoutPrice);
+        mockQuote("100.00", "USD");
+        when(productMapper.updateRefreshPriceIfPriceMatches(
+                eq(1L), eq(1), isNull(), eq(new BigDecimal("100.00")),
+                eq("USD"), eq(CAPTURED_AT), eq(CAPTURED_AT))).thenReturn(1);
+        when(watchlistMapper.selectList(any())).thenReturn(List.of(watchlist));
+        when(cacheService.setIfAbsent(any(), eq("1"), any())).thenReturn(true);
+        when(outboxEventMapper.insertEvent(any())).thenReturn(1);
+
+        priceService.refreshProductPrice(1L);
+
+        verify(productMapper).updateRefreshPriceIfPriceMatches(
+                eq(1L), eq(1), isNull(), eq(new BigDecimal("100.00")),
+                eq("USD"), eq(CAPTURED_AT), eq(CAPTURED_AT));
+        verify(productMapper, never()).updateRefreshMetadataIfPriceMatches(
+                any(), any(), any(), any(), any());
+        verify(priceHistoryMapper).insert(argThat((PriceHistory history) ->
+                new BigDecimal("100.00").compareTo(history.getOldPrice()) == 0
+                        && new BigDecimal("100.00").compareTo(history.getNewPrice()) == 0));
+        verify(outboxEventMapper).insertEvent(any(OutboxEvent.class));
+    }
+
+    @Test
+    void refreshProductPriceDoesNotMarkProviderFailedWhenPersistenceDetectsPriceConflict() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(productMapper.updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(productMapper.selectRefreshStateForUpdate(1L))
+                .thenReturn(Product.builder()
+                        .id(1L)
+                        .status(1)
+                        .currentPrice(new BigDecimal("90.00"))
+                        .build());
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(PriceRefreshConflictException.class);
+
+        verify(metrics).recordPriceProviderFetch(
+                eq("MOCK"),
+                eq(PriceTrackerMetrics.RESULT_SUCCESS),
+                any(java.time.Duration.class));
+        verify(metrics, never()).recordPriceProviderFetch(
+                eq("MOCK"),
+                eq(PriceTrackerMetrics.RESULT_FAILED),
+                any(java.time.Duration.class));
+        verify(metrics).recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, "MOCK");
+        verify(metrics, never()).recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_SUCCESS, "MOCK");
+    }
+
+    @Test
+    void refreshProductPriceDoesNotMarkProviderFailedWhenHistoryInsertThrows() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(priceHistoryMapper.insert(any(PriceHistory.class)))
+                .thenThrow(new DataAccessResourceFailureException("history unavailable"));
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(DataAccessResourceFailureException.class)
+                .hasMessageContaining("history unavailable");
+
+        verify(metrics).recordPriceProviderFetch(
+                eq("MOCK"),
+                eq(PriceTrackerMetrics.RESULT_SUCCESS),
+                any(java.time.Duration.class));
+        verify(metrics, never()).recordPriceProviderFetch(
+                eq("MOCK"),
+                eq(PriceTrackerMetrics.RESULT_FAILED),
+                any(java.time.Duration.class));
+        verify(metrics).recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, "MOCK");
+    }
+
+    @Test
+    void refreshProductPriceRecordsAttemptSuccessAfterTransactionCommit() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("100.00", "USD");
+
+        priceService.refreshProductPrice(1L);
+
+        InOrder inOrder = inOrder(transactionManager, metrics);
+        inOrder.verify(transactionManager).commit(any(TransactionStatus.class));
+        inOrder.verify(metrics).recordPriceRefreshAttempt(
+                PriceTrackerMetrics.RESULT_SUCCESS,
+                "MOCK");
+        verify(metrics, never()).recordPriceRefreshAttempt(
+                PriceTrackerMetrics.RESULT_FAILED,
+                "MOCK");
+    }
+
+    @Test
+    void refreshProductPriceRecordsAttemptFailureWhenCommitFails() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("100.00", "USD");
+        doThrow(new RuntimeException("commit failed"))
+                .when(transactionManager).commit(any(TransactionStatus.class));
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(RuntimeException.class)
+                .hasMessageContaining("commit failed");
+
+        verify(metrics).recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, "MOCK");
+        verify(metrics, never()).recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_SUCCESS, "MOCK");
+    }
+
+    @Test
+    void refreshProductWithRetryIgnoresAttemptSuccessMetricFailureAndClearsProviderContext() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("100.00", "USD");
+        doThrow(new RuntimeException("metrics unavailable"))
+                .when(metrics)
+                .recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_SUCCESS, "MOCK");
+
+        Integer notificationCount = ReflectionTestUtils.invokeMethod(
+                priceService,
+                "refreshProductWithRetry",
+                1L);
+
+        assertThat(notificationCount).isZero();
+        @SuppressWarnings("unchecked")
+        ThreadLocal<String> providerContext = (ThreadLocal<String>) ReflectionTestUtils.getField(
+                priceService,
+                "lastResolvedProvider");
+        assertThat(providerContext).isNotNull();
+        assertThat(providerContext.get()).isNull();
+        verify(priceProvider, times(1)).fetchPrice(any(Product.class));
+        verify(metrics).recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_SUCCESS, "MOCK");
+    }
+
+    @Test
+    void refreshProductWithRetryIgnoresFinalSuccessMetricFailureWithoutRetrying() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("100.00", "USD");
+        doThrow(new RuntimeException("final metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_SUCCESS, "MOCK");
+
+        Integer notificationCount = ReflectionTestUtils.invokeMethod(
+                priceService,
+                "refreshProductWithRetry",
+                1L);
+
+        assertThat(notificationCount).isZero();
+        verify(priceProvider, times(1)).fetchPrice(any(Product.class));
+        @SuppressWarnings("unchecked")
+        ThreadLocal<String> providerContext = (ThreadLocal<String>) ReflectionTestUtils.getField(
+                priceService,
+                "lastResolvedProvider");
+        assertThat(providerContext).isNotNull();
+        assertThat(providerContext.get()).isNull();
+    }
+
+    @Test
+    void refreshProductWithRetryPreservesUnavailableExceptionWhenFinalMetricFails() {
+        when(productMapper.selectById(1L)).thenReturn(null);
+        doThrow(new RuntimeException("final metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, "unknown");
+
+        assertThatThrownBy(() -> ReflectionTestUtils.invokeMethod(
+                priceService,
+                "refreshProductWithRetry",
+                1L))
+                .isInstanceOf(ProductRefreshUnavailableException.class);
+
+        verify(productMapper, times(1)).selectById(1L);
+        verify(priceProvider, never()).fetchPrice(any(Product.class));
+    }
+
+    @Test
+    void refreshProductWithRetryPreservesNonRetryableProviderExceptionWhenMetricsFail() {
+        PriceProviderException providerException = new PriceProviderException(
+                PriceProviderFailureType.AUTHENTICATION_FAILED,
+                false,
+                "invalid key");
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        when(priceProviderRouter.route(any(Product.class))).thenReturn(priceProvider);
+        when(priceProvider.providerCode()).thenReturn("SERPAPI");
+        when(priceProvider.fetchPrice(any(Product.class))).thenThrow(providerException);
+        doThrow(new RuntimeException("provider fetch metric unavailable"))
+                .when(metrics)
+                .recordPriceProviderFetch(
+                        eq("SERPAPI"),
+                        eq(PriceTrackerMetrics.RESULT_FAILED),
+                        any(java.time.Duration.class));
+        doThrow(new RuntimeException("provider failure metric unavailable"))
+                .when(metrics)
+                .recordPriceProviderFailure("SERPAPI", "AUTHENTICATION_FAILED");
+        doThrow(new RuntimeException("attempt metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, "SERPAPI");
+        doThrow(new RuntimeException("final metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, "SERPAPI");
+
+        assertThatThrownBy(() -> ReflectionTestUtils.invokeMethod(
+                priceService,
+                "refreshProductWithRetry",
+                1L))
+                .isSameAs(providerException);
+
+        verify(priceProvider, times(1)).fetchPrice(any(Product.class));
+        verify(metrics).recordPriceProviderFailure("SERPAPI", "AUTHENTICATION_FAILED");
+    }
+
+    @Test
+    void refreshProductWithRetryPreservesLastConflictWhenFinalMetricFails() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(productMapper.updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(productMapper.selectRefreshStateForUpdate(1L))
+                .thenReturn(Product.builder()
+                        .id(1L)
+                        .status(1)
+                        .currentPrice(new BigDecimal("90.00"))
+                        .build());
+        doThrow(new RuntimeException("final metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshFinal(PriceTrackerMetrics.RESULT_FAILED, "MOCK");
+
+        assertThatThrownBy(() -> ReflectionTestUtils.invokeMethod(
+                priceService,
+                "refreshProductWithRetry",
+                1L))
+                .isInstanceOf(PriceRefreshConflictException.class)
+                .hasMessageContaining("actualPrice=90.00");
+
+        verify(priceProvider, times(3)).fetchPrice(any(Product.class));
+    }
+
+    @Test
+    void refreshProductPricePreservesDatabaseExceptionWhenAttemptFailedMetricFails() {
+        DataAccessResourceFailureException databaseException =
+                new DataAccessResourceFailureException("history unavailable");
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(priceHistoryMapper.insert(any(PriceHistory.class))).thenThrow(databaseException);
+        doThrow(new RuntimeException("attempt metric unavailable"))
+                .when(metrics)
+                .recordPriceRefreshAttempt(PriceTrackerMetrics.RESULT_FAILED, "MOCK");
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isSameAs(databaseException);
+    }
+
+    @Test
+    void refreshProductPriceContinuesPersistenceWhenProviderSuccessMetricFails() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(watchlistMapper.selectList(any())).thenReturn(List.of());
+        doThrow(new RuntimeException("provider metric unavailable"))
+                .when(metrics)
+                .recordPriceProviderFetch(
+                        eq("MOCK"),
+                        eq(PriceTrackerMetrics.RESULT_SUCCESS),
+                        any(java.time.Duration.class));
+
+        priceService.refreshProductPrice(1L);
+
+        verify(productMapper).updateRefreshPriceIfPriceMatches(
+                eq(1L), eq(1), eq(new BigDecimal("100.00")), eq(new BigDecimal("79.00")),
+                eq("USD"), eq(CAPTURED_AT), eq(CAPTURED_AT));
+        verify(priceHistoryMapper).insert(any(PriceHistory.class));
+    }
+
+    @Test
+    void refreshProductPricePreservesProviderExceptionWhenProviderFailedMetricFails() {
+        PriceProviderException providerException = new PriceProviderException(
+                PriceProviderFailureType.RATE_LIMITED,
+                true,
+                "rate limited");
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        when(priceProviderRouter.route(any(Product.class))).thenReturn(priceProvider);
+        when(priceProvider.providerCode()).thenReturn("SERPAPI");
+        when(priceProvider.fetchPrice(any(Product.class))).thenThrow(providerException);
+        doThrow(new RuntimeException("provider metric unavailable"))
+                .when(metrics)
+                .recordPriceProviderFetch(
+                        eq("SERPAPI"),
+                        eq(PriceTrackerMetrics.RESULT_FAILED),
+                        any(java.time.Duration.class));
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isSameAs(providerException);
+
+        verify(metrics).recordPriceProviderFailure("SERPAPI", "RATE_LIMITED");
+    }
+
+    @Test
+    void refreshProductPriceRejectsUnexpectedOutboxAffectedRows() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(watchlistMapper.selectList(any())).thenReturn(List.of(activeWatchlistWithoutDedupPrice()));
+        when(cacheService.setIfAbsent(any(), eq("1"), any())).thenReturn(true);
+        when(outboxEventMapper.insertEvent(any())).thenReturn(0);
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("outbox event insert affected unexpected rows");
+    }
+
+    @Test
+    void refreshProductPriceThrowsWhenPriceHistoryInsertDoesNotAffectOneRow() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(priceHistoryMapper.insert(any(PriceHistory.class))).thenReturn(0);
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasMessageContaining("price history insert affected unexpected rows");
+
+        verify(outboxEventMapper, never()).insertEvent(any());
+    }
+
+    @Test
+    void refreshProductPricePropagatesNonDuplicateOutboxFailure() {
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(watchlistMapper.selectList(any())).thenReturn(List.of(activeWatchlistWithoutDedupPrice()));
+        when(cacheService.setIfAbsent(any(), eq("1"), any())).thenReturn(true);
+        when(outboxEventMapper.insertEvent(any()))
+                .thenThrow(new DataAccessResourceFailureException("database unavailable"));
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(DataAccessResourceFailureException.class)
+                .hasMessageContaining("database unavailable");
+    }
+
+    @Test
+    void refreshProductPricePreservesJsonProcessingExceptionCause() throws Exception {
+        JsonProcessingException jsonException = new JsonProcessingException("serialization failed") { };
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(watchlistMapper.selectList(any())).thenReturn(List.of(activeWatchlistWithoutDedupPrice()));
+        when(cacheService.setIfAbsent(any(), eq("1"), any())).thenReturn(true);
+        doThrow(jsonException).when(objectMapper).writeValueAsString(any(PriceAlertMessage.class));
+
+        assertThatThrownBy(() -> priceService.refreshProductPrice(1L))
+                .isInstanceOf(BusinessException.class)
+                .hasCause(jsonException);
+
+        verify(outboxEventMapper, never()).insertEvent(any());
+    }
+
+    @Test
+    void refreshActiveProductsDoesNotRetryUnavailableProduct() {
+        ReflectionTestUtils.setField(priceService, "priceRefreshBatchSize", 1);
+        when(productMapper.selectPage(any(Page.class), any())).thenReturn(activeProductPage(activeProduct(1L)));
+        when(productMapper.selectById(1L)).thenReturn(activeProduct());
+        mockQuote("79.00", "USD");
+        when(productMapper.updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(0);
+        when(productMapper.selectRefreshStateForUpdate(1L))
+                .thenReturn(Product.builder().id(1L).status(0).currentPrice(new BigDecimal("100.00")).build());
+
+        priceService.refreshActiveProducts();
+
+        verify(productMapper, times(1)).selectById(1L);
+        verify(productMapper, times(1)).selectRefreshStateForUpdate(1L);
+    }
+
+    @Test
+    void refreshActiveProductsRetriesConcurrentPriceChange() {
+        ReflectionTestUtils.setField(priceService, "priceRefreshBatchSize", 1);
+        Product retriedProduct = activeProduct();
+        retriedProduct.setCurrentPrice(new BigDecimal("90.00"));
+        when(productMapper.selectPage(any(Page.class), any())).thenReturn(activeProductPage(activeProduct(1L)));
+        when(productMapper.selectById(1L)).thenReturn(activeProduct(), retriedProduct);
+        mockQuote("79.00", "USD");
+        when(watchlistMapper.selectList(any())).thenReturn(List.of());
+        when(productMapper.updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any())).thenReturn(0, 1);
+        when(productMapper.selectRefreshStateForUpdate(1L))
+                .thenReturn(Product.builder().id(1L).status(1).currentPrice(new BigDecimal("90.00")).build());
+
+        priceService.refreshActiveProducts();
+
+        verify(productMapper, times(2)).selectById(1L);
+        verify(productMapper, times(2)).updateRefreshPriceIfPriceMatches(
+                any(), any(), any(), any(), any(), any(), any());
     }
 }
